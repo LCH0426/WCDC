@@ -119,111 +119,41 @@ cp target/x86_64-unknown-linux-musl/release/wcdc-server \
 
 ### 3.4 飞牛 fpk
 
-fpk 由两层归档组成：
+**fpk 必须是 gzip 压缩的 tar，不能是普通 tar。** 普通 tar 会被飞牛识别为“不是有效 fpk 文件”。同时 manifest 里的 `checksum` 是 `app.tgz` 的 MD5，不能沿用旧值。
 
-1. `app.tgz`：应用目录内容，通常包含 `bin/wcdc-server`、`ui/config`、图标等。
-2. 外层 `wcdc.fpk`：包含 `app.tgz`、`cmd/`、`config/`、`manifest`、`ICON.PNG`、`ICON_256.PNG`、`wizard/`。
-
-打包前：
+使用官方 fnpack 1.2.3 生成，再修正 Windows 下的 0666 权限：
 
 ```bash
-cargo zigbuild --release -p wcdc-server --target x86_64-unknown-linux-musl
+# 下载一次即可
+curl -L -o fnpack.exe https://static2.fnnas.com/fnpack/fnpack-1.2.3-windows-amd64
 
+cargo zigbuild --release -p wcdc-server --target x86_64-unknown-linux-musl
 cp target/x86_64-unknown-linux-musl/release/wcdc-server \
    packaging/fnos/wcdc/app/bin/wcdc-server
+
+cd packaging/fnos/wcdc
+# fnpack.exe 放在仓库根目录时
+../../../fnpack.exe build
+python -I ../repack_fpk.py wcdc.fpk
 ```
 
-**Windows 上的 `fnpack` 曾把文件写成 0666，导致飞牛无法执行启动脚本和二进制。** 不要依赖 Windows 下的默认 tar 权限。用 Python `tarfile` 显式设置：
+`fnpack build` 会生成 gzip fpk，并做这些事：
 
-- `app/bin/wcdc-server`：`0755`
-- `cmd/*`：`0755`
-- `manifest`、`config/*`、`app/ui/config`、图标：`0644`
-- `app.tgz`、`wcdc.fpk`：`0644`
+- 生成内层 `app.tgz`，包含 `bin/`、`ui/` 和 `config/`
+- 在 manifest 末尾写入 `checksum = <app.tgz 的 MD5>`
+- 外层包含 `app.tgz`、`cmd/`、`config/`、`ICON.PNG`、`ICON_256.PNG`、`manifest`、`wizard/`
+
+`packaging/fnos/repack_fpk.py` 只做两件事：
+
+1. 把 `bin/wcdc-server` 设为 `0755`，其他文件设为 `0644`，目录 `0755`，并去掉 `.gitkeep`；
+2. 用新的 `app.tgz` 重新计算 MD5，更新 manifest 的 `checksum`，再写回 **gzip** 外层包。
+
+不要再用“手动普通 tar 打包”的方式生成 fpk。
 
 `.gitattributes` 已强制 `*.sh`、`packaging/fnos/*/cmd/*`、`config/*`、`manifest` 使用 LF。打包前仍要确认这些文件没有 CRLF，否则 fnOS 上的 `#!/bin/bash\r` 会启动失败：
 
 ```bash
-python -I -c "import pathlib; [p.write_bytes(p.read_bytes().replace(b'\\r\\n', b'\\n')) for p in pathlib.Path('packaging/fnos/wcdc/cmd').iterdir() if p.is_file()]"
-```
-
-外层 fpk 的目录结构与当前 `packaging/fnos/wcdc/wcdc.fpk` 保持一致：
-
-```text
-app.tgz
-cmd/main
-cmd/install_init
-cmd/install_callback
-cmd/upgrade_init
-cmd/upgrade_callback
-cmd/uninstall_init
-cmd/uninstall_callback
-cmd/config_init
-cmd/config_callback
-config/privilege
-config/resource
-ICON.PNG
-ICON_256.PNG
-manifest
-wizard/
-```
-
-可用如下 Python 逻辑生成（在 `packaging/fnos/wcdc` 下执行，先确认 `app/` 内容已更新）：
-
-```python
-import os, tarfile
-
-root = os.getcwd()
-
-def add_entry(tf, src, arc, mode):
-    arc = arc.replace(os.sep, "/").strip("/")
-    info = tf.gettarinfo(src, arcname=arc)
-    info.mode = mode
-    info.uid = info.gid = 0
-    info.uname = info.gname = "root"
-    if info.isfile():
-        with open(src, "rb") as fh:
-            tf.addfile(info, fh)
-    else:
-        tf.addfile(info)
-
-def add_tree(tf, fs_root, arc_root, file_mode, dir_mode=0o755):
-    for base, dirs, files in os.walk(fs_root):
-        dirs.sort(); files.sort()
-        rel = os.path.relpath(base, fs_root)
-        if rel != ".":
-            add_entry(tf, base, os.path.join(arc_root, rel), dir_mode)
-        elif arc_root:
-            add_entry(tf, base, arc_root, dir_mode)
-        for name in files:
-            if name == ".gitkeep":
-                continue
-            src = os.path.join(base, name)
-            relpath = name if rel == "." else os.path.join(rel, name)
-            arc = os.path.join(arc_root, relpath) if arc_root else relpath
-            add_entry(tf, src, arc, file_mode(name, src))
-
-# 1) app.tgz：包含 app/ 的“内容”，不要多包一层 app/
-with tarfile.open("app.tgz", "w:gz", format=tarfile.GNU_FORMAT) as tf:
-    add_tree(
-        tf,
-        "app",
-        "",
-        lambda name, _src: 0o755 if name == "wcdc-server" else 0o644,
-    )
-
-# 2) wcdc.fpk
-with tarfile.open("wcdc.fpk", "w", format=tarfile.GNU_FORMAT) as tf:
-    add_tree(tf, "cmd", "cmd", lambda _name, _src: 0o755)
-    add_tree(tf, "wizard", "wizard", lambda _name, _src: 0o644)
-
-    add_entry(tf, "config", "config", 0o755)
-    for name in ("privilege", "resource"):
-        add_entry(tf, os.path.join("config", name), os.path.join("config", name), 0o644)
-
-    add_entry(tf, "ICON.PNG", "ICON.PNG", 0o644)
-    add_entry(tf, "ICON_256.PNG", "ICON_256.PNG", 0o644)
-    add_entry(tf, "manifest", "manifest", 0o644)
-    add_entry(tf, "app.tgz", "app.tgz", 0o644)
+python -I -c "import pathlib; [p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n')) for p in pathlib.Path('packaging/fnos/wcdc/cmd').iterdir() if p.is_file()]"
 ```
 
 打包后复制并生成校验和：

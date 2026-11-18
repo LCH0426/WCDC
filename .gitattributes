@@ -1,5 +1,6 @@
 # Shell scripts and fnOS lifecycle files must stay LF, otherwise they fail on Linux.
 *.sh text eol=lf
+*.py text eol=lf
 *.bat text eol=crlf
 packaging/fnos/*/cmd/* text eol=lf
 packaging/fnos/*/config/* text eol=lf
