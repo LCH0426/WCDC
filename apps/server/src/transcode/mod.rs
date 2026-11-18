@@ -560,6 +560,22 @@ impl TranscodeService {
         self.jobs.cancel(id).await
     }
 
+    pub async fn cancel_all_jobs(&self) -> usize {
+        self.jobs.cancel_all().await
+    }
+
+    pub async fn pause_all_jobs(&self) -> usize {
+        self.jobs.pause_all().await
+    }
+
+    pub async fn resume_all_jobs(&self) -> usize {
+        self.jobs.resume_all().await
+    }
+
+    pub async fn queue_state(&self) -> (bool, usize, usize) {
+        self.jobs.queue_state().await
+    }
+
     pub async fn retry_job(&self, id: &str) -> Result<Vec<JobView>, String> {
         self.jobs.retry(id).await
     }

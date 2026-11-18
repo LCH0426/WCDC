@@ -8,6 +8,7 @@ import {
   MdDeleteOutline,
   MdFolderOpen,
   MdImage,
+  MdPause,
   MdPlayArrow,
   MdReplay,
   MdSearch,
@@ -15,6 +16,7 @@ import {
 } from 'react-icons/md';
 import toast from 'react-hot-toast';
 
+import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { StorageBrowser } from '@/components/StorageBrowser';
 import { VendorLogo } from '@/components/VendorLogo';
 import { useApp } from '@/context/app';
@@ -305,10 +307,17 @@ export function ImageConvertPanel() {
   const [jobs, setJobs] = useState<ImageJobView[]>([]);
   const [stats, setStats] = useState<TranscodeStats | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [queuePaused, setQueuePaused] = useState(false);
+  const [cancelAllOpen, setCancelAllOpen] = useState(false);
 
   const loadJobs = useCallback(async () => {
     try {
-      setJobs(sortJobs(await api.imageJobs()));
+      const [nextJobs, queue] = await Promise.all([
+        api.imageJobs(),
+        api.imageQueueState(),
+      ]);
+      setJobs(sortJobs(nextJobs));
+      setQueuePaused(queue.paused);
     } catch {
       // SSE and later polling retry.
     }
@@ -487,6 +496,43 @@ export function ImageConvertPanel() {
       toast.success('已重新加入队列');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '重试失败');
+    }
+  };
+
+  const pauseAll = async () => {
+    try {
+      const result = await api.imagePauseAll();
+      setQueuePaused(true);
+      toast.success(
+        result.affected > 0
+          ? `已暂停，后续 ${result.affected} 个任务不会启动`
+          : '已暂停'
+      );
+      void loadJobs();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '暂停失败');
+    }
+  };
+
+  const resumeAll = async () => {
+    try {
+      await api.imageResumeAll();
+      setQueuePaused(false);
+      toast.success('已继续图片转换');
+      void loadJobs();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '继续失败');
+    }
+  };
+
+  const cancelAll = async () => {
+    try {
+      const result = await api.imageCancelAll();
+      setQueuePaused(false);
+      toast.success(`已请求取消 ${result.canceled} 个任务`);
+      window.setTimeout(() => void loadJobs(), 300);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '全部取消失败');
     }
   };
 
@@ -878,18 +924,53 @@ export function ImageConvertPanel() {
             <span className='rounded-full bg-danger/10 px-2 py-0.5 text-danger'>
               失败 {failedCount}
             </span>
+            {queuePaused && (
+              <span className='rounded-full bg-warning/10 px-2 py-0.5 text-warning'>
+                已暂停
+              </span>
+            )}
           </div>
         </div>
-        <Button
-          size='sm'
-          variant='flat'
-          isLoading={clearing}
-          isDisabled={jobs.length === 0}
-          onPress={() => void clearFinished()}
-          startContent={<MdDeleteOutline size={16} />}
-        >
-          清理已结束
-        </Button>
+        <div className='flex flex-wrap items-center gap-2'>
+          <Button
+            size='sm'
+            variant='flat'
+            isDisabled={!activeJobs || queuePaused}
+            onPress={() => void pauseAll()}
+            startContent={<MdPause size={16} />}
+          >
+            全部暂停
+          </Button>
+          <Button
+            size='sm'
+            variant='flat'
+            isDisabled={!queuePaused}
+            onPress={() => void resumeAll()}
+            startContent={<MdPlayArrow size={16} />}
+          >
+            全部继续
+          </Button>
+          <Button
+            size='sm'
+            variant='flat'
+            color='danger'
+            isDisabled={!activeJobs}
+            onPress={() => setCancelAllOpen(true)}
+            startContent={<MdCancel size={16} />}
+          >
+            全部取消
+          </Button>
+          <Button
+            size='sm'
+            variant='flat'
+            isLoading={clearing}
+            isDisabled={jobs.length === 0}
+            onPress={() => void clearFinished()}
+            startContent={<MdDeleteOutline size={16} />}
+          >
+            清理已结束
+          </Button>
+        </div>
       </div>
 
       {allFinished && (
@@ -949,6 +1030,19 @@ export function ImageConvertPanel() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={cancelAllOpen}
+        onClose={() => setCancelAllOpen(false)}
+        title='取消全部图片转换任务'
+        description='正在处理的当前图片会完成写入，排队中的任务会被取消。已完成的 WebP 文件不会删除。'
+        confirmLabel='全部取消'
+        danger
+        onConfirm={() => {
+          setCancelAllOpen(false);
+          void cancelAll();
+        }}
+      />
 
       <StorageBrowser
         open={browseTarget !== null}

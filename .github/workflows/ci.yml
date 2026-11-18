@@ -16,8 +16,20 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build embedded frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
       - name: Test protocol/core
         run: cargo test -p quark-protocol -p quark-core
+      - name: Test server
+        run: cargo test -p wcdc-server
       - name: Build server
         run: cargo build -p wcdc-server --release
 
@@ -31,7 +43,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci

@@ -402,6 +402,40 @@ pub async fn transcode_jobs(
     Ok(Json(state.transcode.list_jobs().await))
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueState {
+    pub paused: bool,
+    pub running: usize,
+    pub queued: usize,
+}
+
+pub async fn transcode_queue_state(
+    State(state): State<AppState>,
+) -> Json<QueueState> {
+    let (paused, running, queued) = state.transcode.queue_state().await;
+    Json(QueueState {
+        paused,
+        running,
+        queued,
+    })
+}
+
+pub async fn transcode_pause_all(State(state): State<AppState>) -> ApiResult<Value> {
+    let suspended = state.transcode.pause_all_jobs().await;
+    Ok(Json(json!({ "paused": true, "affected": suspended })))
+}
+
+pub async fn transcode_resume_all(State(state): State<AppState>) -> ApiResult<Value> {
+    let resumed = state.transcode.resume_all_jobs().await;
+    Ok(Json(json!({ "paused": false, "affected": resumed })))
+}
+
+pub async fn transcode_cancel_all(State(state): State<AppState>) -> ApiResult<Value> {
+    let canceled = state.transcode.cancel_all_jobs().await;
+    Ok(Json(json!({ "canceled": canceled })))
+}
+
 pub async fn transcode_create_jobs(
     State(state): State<AppState>,
     Json(request): Json<crate::transcode::CreateJobsRequest>,
@@ -509,6 +543,30 @@ pub async fn images_jobs(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<crate::images::ImageJobView>> {
     Ok(Json(state.images.list().await))
+}
+
+pub async fn images_queue_state(State(state): State<AppState>) -> Json<QueueState> {
+    let (paused, running, queued) = state.images.queue_state().await;
+    Json(QueueState {
+        paused,
+        running,
+        queued,
+    })
+}
+
+pub async fn images_pause_all(State(state): State<AppState>) -> ApiResult<Value> {
+    let affected = state.images.pause_all().await;
+    Ok(Json(json!({ "paused": true, "affected": affected })))
+}
+
+pub async fn images_resume_all(State(state): State<AppState>) -> ApiResult<Value> {
+    let affected = state.images.resume_all().await;
+    Ok(Json(json!({ "paused": false, "affected": affected })))
+}
+
+pub async fn images_cancel_all(State(state): State<AppState>) -> ApiResult<Value> {
+    let canceled = state.images.cancel_all().await;
+    Ok(Json(json!({ "canceled": canceled })))
 }
 
 pub async fn images_create_jobs(

@@ -321,6 +321,12 @@ export interface ScanProgress {
   error?: string | null;
 }
 
+export interface QueueState {
+  paused: boolean;
+  running: number;
+  queued: number;
+}
+
 export interface JobView {
   id: string;
   sourcePath: string;

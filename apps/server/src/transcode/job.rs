@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, watch, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use super::command::{self, AudioMode, ResolvedOptions};
@@ -66,11 +66,14 @@ struct JobEntry {
     options: ResolvedOptions,
     cancel: CancellationToken,
     ffmpeg: PathBuf,
+    pid: Option<u32>,
+    suspended: bool,
 }
 
 struct Inner {
     jobs: RwLock<HashMap<String, JobEntry>>,
     events: broadcast::Sender<TranscodeEvent>,
+    paused: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -81,10 +84,12 @@ pub struct JobManager {
 impl JobManager {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(512);
+        let (paused, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 jobs: RwLock::new(HashMap::new()),
                 events,
+                paused,
             }),
         }
     }
@@ -103,6 +108,180 @@ impl JobManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
         views
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.inner.paused.borrow()
+    }
+
+    pub async fn queue_state(&self) -> (bool, usize, usize) {
+        let jobs = self.inner.jobs.read().await;
+        let running = jobs
+            .values()
+            .filter(|entry| entry.view.status == "running")
+            .count();
+        let queued = jobs
+            .values()
+            .filter(|entry| entry.view.status == "queued")
+            .count();
+        (self.is_paused(), running, queued)
+    }
+
+    async fn wait_until_resumed(&self, cancel: &CancellationToken) {
+        loop {
+            if !self.is_paused() {
+                return;
+            }
+            let mut receiver = self.inner.paused.subscribe();
+            if !*receiver.borrow() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn set_pid(&self, id: &str, pid: Option<u32>) {
+        self.update(id, |entry| {
+            entry.pid = pid;
+        })
+        .await;
+    }
+
+    async fn clear_pid(&self, id: &str) {
+        self.update(id, |entry| {
+            entry.pid = None;
+            entry.suspended = false;
+        })
+        .await;
+    }
+
+    async fn suspend_job(&self, id: &str) -> bool {
+        let pid = {
+            let jobs = self.inner.jobs.read().await;
+            let Some(entry) = jobs.get(id) else {
+                return false;
+            };
+            if entry.suspended || entry.view.status != "running" {
+                return false;
+            }
+            entry.pid
+        };
+        let Some(pid) = pid else {
+            return false;
+        };
+        match process_control::suspend(pid) {
+            Ok(()) => {
+                self.update(id, |entry| {
+                    entry.suspended = true;
+                })
+                .await;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(id, pid, %error, "transcode process suspend failed");
+                false
+            }
+        }
+    }
+
+    async fn resume_job(&self, id: &str) -> bool {
+        let pid = {
+            let jobs = self.inner.jobs.read().await;
+            let Some(entry) = jobs.get(id) else {
+                return false;
+            };
+            if !entry.suspended {
+                return false;
+            }
+            entry.pid
+        };
+        let Some(pid) = pid else {
+            return false;
+        };
+        match process_control::resume(pid) {
+            Ok(()) => {
+                self.update(id, |entry| {
+                    entry.suspended = false;
+                })
+                .await;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(id, pid, %error, "transcode process resume failed");
+                false
+            }
+        }
+    }
+
+    /// Pause queued jobs and suspend currently running ffmpeg processes.
+    pub async fn pause_all(&self) -> usize {
+        let _ = self.inner.paused.send_replace(true);
+        let ids: Vec<String> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter(|(_, entry)| {
+                    entry.view.status == "running"
+                        && entry.pid.is_some()
+                        && !entry.suspended
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut suspended = 0;
+        for id in ids {
+            if self.suspend_job(&id).await {
+                suspended += 1;
+            }
+        }
+        tracing::info!(suspended, "transcode all jobs paused");
+        suspended
+    }
+
+    /// Resume suspended ffmpeg processes and let queued jobs continue.
+    pub async fn resume_all(&self) -> usize {
+        let _ = self.inner.paused.send_replace(false);
+        let ids: Vec<String> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter(|(_, entry)| entry.suspended)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let mut resumed = 0;
+        for id in ids {
+            if self.resume_job(&id).await {
+                resumed += 1;
+            }
+        }
+        tracing::info!(resumed, "transcode all jobs resumed");
+        resumed
+    }
+
+    /// Cancel every queued or running job. Also clears the paused state so
+    /// subsequently queued work is not stuck.
+    pub async fn cancel_all(&self) -> usize {
+        let _ = self.inner.paused.send_replace(false);
+        let ids: Vec<String> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter(|(_, entry)| {
+                    entry.view.status == "queued" || entry.view.status == "running"
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in &ids {
+            let _ = self.cancel(id).await;
+        }
+        tracing::info!(count = ids.len(), "transcode all jobs canceled");
+        ids.len()
     }
 
     pub async fn create_jobs(
@@ -174,6 +353,8 @@ impl JobManager {
                         options,
                         cancel: CancellationToken::new(),
                         ffmpeg: ffmpeg.clone(),
+                        pid: None,
+                        suspended: false,
                     },
                 );
             }
@@ -214,6 +395,12 @@ impl JobManager {
             )
         };
 
+        if cancel.is_cancelled() {
+            self.mark_canceled(id).await;
+            return;
+        }
+
+        self.wait_until_resumed(&cancel).await;
         if cancel.is_cancelled() {
             self.mark_canceled(id).await;
             return;
@@ -285,8 +472,14 @@ impl JobManager {
                     return;
                 }
             };
+            let pid = child.id();
+            self.set_pid(id, pid).await;
+            if self.is_paused() {
+                self.suspend_job(id).await;
+            }
 
             let Some(stdout) = child.stdout.take() else {
+                self.clear_pid(id).await;
                 self.fail_job(id, "无法读取 ffmpeg 输出".to_string()).await;
                 return;
             };
@@ -352,6 +545,7 @@ impl JobManager {
             }
 
             let status = child.wait().await;
+            self.clear_pid(id).await;
             let stderr_text = stderr_task.await.unwrap_or_default();
 
             if canceled || cancel.is_cancelled() {
@@ -767,6 +961,90 @@ fn encoder_open_failure(stderr: &str) -> bool {
         || text.contains("could not open encoder")
         || text.contains("error initializing output stream")
         || text.contains("failed to configure output pad")
+}
+
+#[cfg(unix)]
+mod process_control {
+    pub fn suspend(pid: u32) -> Result<(), String> {
+        signal(pid, libc::SIGSTOP)
+    }
+
+    pub fn resume(pid: u32) -> Result<(), String> {
+        signal(pid, libc::SIGCONT)
+    }
+
+    fn signal(pid: u32, signal: libc::c_int) -> Result<(), String> {
+        let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        }
+    }
+}
+
+#[cfg(windows)]
+mod process_control {
+    use std::ffi::c_void;
+
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtSuspendProcess(process_handle: *mut c_void) -> i32;
+        fn NtResumeProcess(process_handle: *mut c_void) -> i32;
+    }
+
+    pub fn suspend(pid: u32) -> Result<(), String> {
+        change(pid, true)
+    }
+
+    pub fn resume(pid: u32) -> Result<(), String> {
+        change(pid, false)
+    }
+
+    fn change(pid: u32, suspend: bool) -> Result<(), String> {
+        let handle = unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let status = unsafe {
+            if suspend {
+                NtSuspendProcess(handle)
+            } else {
+                NtResumeProcess(handle)
+            }
+        };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if status < 0 {
+            Err(format!("NTSTATUS 0x{:08x}", status as u32))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod process_control {
+    pub fn suspend(_pid: u32) -> Result<(), String> {
+        Err("当前平台不支持暂停进程".to_string())
+    }
+
+    pub fn resume(_pid: u32) -> Result<(), String> {
+        Err("当前平台不支持恢复进程".to_string())
+    }
 }
 
 fn now_ms() -> i64 {

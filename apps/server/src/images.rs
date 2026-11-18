@@ -7,7 +7,7 @@ use std::time::Instant;
 use futures_util::stream::{self, StreamExt};
 use image::{AnimationDecoder, DynamicImage};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 use zenwebp::mux::{AnimationConfig, AnimationEncoder};
@@ -117,6 +117,7 @@ struct JobEntry {
 struct Inner {
     jobs: RwLock<HashMap<String, JobEntry>>,
     events: broadcast::Sender<ImageEvent>,
+    paused: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -128,10 +129,12 @@ pub struct ImageService {
 impl ImageService {
     pub fn new(history: Arc<crate::history::HistoryService>) -> Self {
         let (events, _) = broadcast::channel(512);
+        let (paused, _) = watch::channel(false);
         Self {
             inner: Arc::new(Inner {
                 jobs: RwLock::new(HashMap::new()),
                 events,
+                paused,
             }),
             history,
         }
@@ -422,6 +425,11 @@ impl ImageService {
             self.mark_canceled(id).await;
             return;
         }
+        self.wait_until_resumed(&cancel).await;
+        if cancel.is_cancelled() {
+            self.mark_canceled(id).await;
+            return;
+        }
 
         let source = PathBuf::from(&view.source_path);
         let output = PathBuf::from(&view.output_path);
@@ -612,6 +620,85 @@ impl ImageService {
                 .then_with(|| left.id.cmp(&right.id))
         });
         views
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.inner.paused.borrow()
+    }
+
+    pub async fn queue_state(&self) -> (bool, usize, usize) {
+        let jobs = self.inner.jobs.read().await;
+        let running = jobs
+            .values()
+            .filter(|entry| entry.view.status == "running")
+            .count();
+        let queued = jobs
+            .values()
+            .filter(|entry| entry.view.status == "queued")
+            .count();
+        (self.is_paused(), running, queued)
+    }
+
+    async fn active_count(&self) -> usize {
+        let jobs = self.inner.jobs.read().await;
+        jobs.values()
+            .filter(|entry| {
+                entry.view.status == "queued" || entry.view.status == "running"
+            })
+            .count()
+    }
+
+    async fn wait_until_resumed(&self, cancel: &CancellationToken) {
+        loop {
+            if !self.is_paused() {
+                return;
+            }
+            let mut receiver = self.inner.paused.subscribe();
+            if !*receiver.borrow() {
+                return;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pause queued image jobs. A file already being encoded finishes first.
+    pub async fn pause_all(&self) -> usize {
+        let _ = self.inner.paused.send_replace(true);
+        let active = self.active_count().await;
+        tracing::info!(active, "image conversion paused");
+        active
+    }
+
+    pub async fn resume_all(&self) -> usize {
+        let _ = self.inner.paused.send_replace(false);
+        let active = self.active_count().await;
+        tracing::info!(active, "image conversion resumed");
+        active
+    }
+
+    pub async fn cancel_all(&self) -> usize {
+        let _ = self.inner.paused.send_replace(false);
+        let ids: Vec<String> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter(|(_, entry)| {
+                    entry.view.status == "queued" || entry.view.status == "running"
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in &ids {
+            let _ = self.cancel(id).await;
+        }
+        tracing::info!(count = ids.len(), "image conversion all canceled");
+        ids.len()
     }
 
     pub async fn cancel(&self, id: &str) -> Result<(), String> {

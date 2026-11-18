@@ -15,6 +15,7 @@ import {
   MdImage,
   MdMemory,
   MdMovieFilter,
+  MdPause,
   MdPlayArrow,
   MdReplay,
   MdSearch,
@@ -846,10 +847,17 @@ export default function TranscodePage() {
   const [jobs, setJobs] = useState<JobView[]>([]);
   const [stats, setStats] = useState<TranscodeStats | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [queuePaused, setQueuePaused] = useState(false);
+  const [cancelAllOpen, setCancelAllOpen] = useState(false);
 
   const loadJobs = useCallback(async () => {
     try {
-      setJobs(sortJobs(await api.transcodeJobs()));
+      const [nextJobs, queue] = await Promise.all([
+        api.transcodeJobs(),
+        api.transcodeQueueState(),
+      ]);
+      setJobs(sortJobs(nextJobs));
+      setQueuePaused(queue.paused);
     } catch {
       // The page still works with SSE updates; polling retries later.
     }
@@ -1324,6 +1332,47 @@ export default function TranscodePage() {
       toast.success('已重新加入队列');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '重试失败');
+    }
+  };
+
+  const pauseAll = async () => {
+    try {
+      const result = await api.transcodePauseAll();
+      setQueuePaused(true);
+      toast.success(
+        result.affected > 0
+          ? `已暂停，${result.affected} 个运行中的进程已挂起`
+          : '已暂停，后续任务不会再启动'
+      );
+      void loadJobs();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '暂停失败');
+    }
+  };
+
+  const resumeAll = async () => {
+    try {
+      const result = await api.transcodeResumeAll();
+      setQueuePaused(false);
+      toast.success(
+        result.affected > 0
+          ? `已继续，${result.affected} 个进程已恢复`
+          : '已继续'
+      );
+      void loadJobs();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '继续失败');
+    }
+  };
+
+  const cancelAll = async () => {
+    try {
+      const result = await api.transcodeCancelAll();
+      setQueuePaused(false);
+      toast.success(`已请求取消 ${result.canceled} 个任务`);
+      window.setTimeout(() => void loadJobs(), 300);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '全部取消失败');
     }
   };
 
@@ -2271,18 +2320,53 @@ export default function TranscodePage() {
                   <span className='rounded-full bg-secondary/15 px-2 py-0.5 text-secondary-700 dark:text-secondary-300'>排队 {queuedCount}</span>
                   <span className='rounded-full bg-success/10 px-2 py-0.5 text-success'>完成 {doneCount}</span>
                   <span className='rounded-full bg-danger/10 px-2 py-0.5 text-danger'>失败 {failedCount}</span>
+                  {queuePaused && (
+                    <span className='rounded-full bg-warning/10 px-2 py-0.5 text-warning'>
+                      已暂停
+                    </span>
+                  )}
                 </div>
               </div>
-              <Button
-                size='sm'
-                variant='flat'
-                isLoading={clearing}
-                isDisabled={jobs.length === 0}
-                onPress={() => void clearFinished()}
-                startContent={<MdDeleteOutline size={16} />}
-              >
-                清理已结束
-              </Button>
+              <div className='flex flex-wrap items-center gap-2'>
+                <Button
+                  size='sm'
+                  variant='flat'
+                  isDisabled={!activeJobs || queuePaused}
+                  onPress={() => void pauseAll()}
+                  startContent={<MdPause size={16} />}
+                >
+                  全部暂停
+                </Button>
+                <Button
+                  size='sm'
+                  variant='flat'
+                  isDisabled={!queuePaused}
+                  onPress={() => void resumeAll()}
+                  startContent={<MdPlayArrow size={16} />}
+                >
+                  全部继续
+                </Button>
+                <Button
+                  size='sm'
+                  variant='flat'
+                  color='danger'
+                  isDisabled={!activeJobs}
+                  onPress={() => setCancelAllOpen(true)}
+                  startContent={<MdCancel size={16} />}
+                >
+                  全部取消
+                </Button>
+                <Button
+                  size='sm'
+                  variant='flat'
+                  isLoading={clearing}
+                  isDisabled={jobs.length === 0}
+                  onPress={() => void clearFinished()}
+                  startContent={<MdDeleteOutline size={16} />}
+                >
+                  清理已结束
+                </Button>
+              </div>
             </div>
 
             {allFinished && (
@@ -2531,6 +2615,19 @@ export default function TranscodePage() {
           if (browseTarget === 'output') setOutputDir(path);
           else setScanDir(path);
           setBrowseTarget(null);
+        }}
+      />
+
+      <ConfirmDialog
+        open={cancelAllOpen}
+        onClose={() => setCancelAllOpen(false)}
+        title='取消全部转码任务'
+        description='正在运行的 ffmpeg 会被终止，排队中的任务会被取消。已完成的输出文件不会删除。'
+        confirmLabel='全部取消'
+        danger
+        onConfirm={() => {
+          setCancelAllOpen(false);
+          void cancelAll();
         }}
       />
 

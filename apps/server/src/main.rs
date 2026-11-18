@@ -352,6 +352,19 @@ fn build_router(state: AppState) -> Router {
                 .delete(api::transcode_clear_jobs),
         )
         .route(
+            "/api/transcode/jobs/cancel-all",
+            post(api::transcode_cancel_all),
+        )
+        .route(
+            "/api/transcode/jobs/pause-all",
+            post(api::transcode_pause_all),
+        )
+        .route(
+            "/api/transcode/jobs/resume-all",
+            post(api::transcode_resume_all),
+        )
+        .route("/api/transcode/queue", get(api::transcode_queue_state))
+        .route(
             "/api/transcode/jobs/{id}/cancel",
             post(api::transcode_cancel_job),
         )
@@ -368,6 +381,19 @@ fn build_router(state: AppState) -> Router {
                 .post(api::images_create_jobs)
                 .delete(api::images_clear_jobs),
         )
+        .route(
+            "/api/images/jobs/cancel-all",
+            post(api::images_cancel_all),
+        )
+        .route(
+            "/api/images/jobs/pause-all",
+            post(api::images_pause_all),
+        )
+        .route(
+            "/api/images/jobs/resume-all",
+            post(api::images_resume_all),
+        )
+        .route("/api/images/queue", get(api::images_queue_state))
         .route(
             "/api/images/jobs/{id}/cancel",
             post(api::images_cancel_job),

@@ -52,6 +52,8 @@ cargo test -p wcdc-server
 
 默认监听 `127.0.0.1:8787`，数据目录为系统默认的 `wcdc` 目录。首次访问需要注册站点密码。
 
+CI 中必须先构建前端再编译 Rust：`web/dist` 被 gitignore，`rust-embed` 在干净 checkout 中找不到它会导致 Rust 任务失败。`.github/workflows/ci.yml` 的 rust job 已加入 `npm ci && npm run build`。
+
 开发时可用独立数据目录和端口，避免污染用户数据：
 
 ```bash
@@ -279,6 +281,9 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
   - 临时文件 `.part`，成功后替换；勾选删除原文件时复用原文件名并在成功后删除源文件。
   - 进度、ETA、速度、GPU 利用率通过 SSE `/api/transcode/events`。
   - 任务只在内存中，服务重启后清空。
+  - 全部暂停：Unix 用 `SIGSTOP`，Windows 用 `NtSuspendProcess`；全部继续用 `SIGCONT` / `NtResumeProcess`。排队任务通过 `watch` 暂停调度。
+  - API：`POST /api/transcode/jobs/pause-all`、`/resume-all`、`/cancel-all`；`GET /api/transcode/queue` 返回 `{paused,running,queued}`。
+  - 暂停状态是全局的，取消全部会同时清除暂停状态。
 
 ## 7. 图片转 WebP 实现
 
@@ -298,6 +303,7 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
 - `cpuThreads` 会限制同时进行的图片编码数；`concurrency` 是上限。
 - 图片任务与 ffmpeg 无关，即使没有 ffmpeg 也能使用“格式转换”标签。
 - 全部完成后前端汇总源大小、输出大小和节省比例/字节数。
+- 全部暂停/继续/取消：`POST /api/images/jobs/pause-all`、`/resume-all`、`/cancel-all`；`GET /api/images/queue`。暂停只阻止后续文件启动，正在编码的当前图片会完成。
 
 ### 7.1 转换归档日志
 
@@ -341,11 +347,13 @@ cd .. && cargo test -p wcdc-server
 1. 独立启动后注册/登录，确认新前端已嵌入（侧边栏显示 WCDC，存在“格式转换”和“归档日志”标签）。
 2. 扫描视频设置最小大小，确认 `skippedBySize` 和界面提示正确；扫描过程中进度条/已分析数量更新；第二次扫描 `cacheHits > 0` 且明显更快。
 3. 软件转码设置 CPU 核心限制，确认 ffmpeg 命令包含两处 `-threads` 且任务成功。
-4. QSV 机器上选择 AV1 QSV，确认不再出现 `format=yuv420p`；如果驱动不支持，应自动回落软件编码并在任务 note 中提示。
-5. 图片扫描能排除 `.webp`，转换后生成 `RIFF....WEBP`，勾选删除时源文件消失，动画 GIF/APNG 帧数保留。
-6. 完成一批视频/图片后，归档日志出现一条记录，包含数量、总耗时、大小变化和逐文件明细；重启服务后记录仍在。
-7. 飞牛模式：侧边栏无“服务器文件/终端”；直连路由重定向；终端 WS 403；授权目录外全部 400。
-8. 飞牛网关：登录后跳转不丢 `/app/<appname>`，刷新 iframe 不白屏。
+4. 转码中点击“全部暂停”，进度应停止；点击“全部继续”后继续；“全部取消”后所有活动任务变为已取消。
+5. 图片页在暂停状态下新建任务应保持排队，继续后完成。
+6. QSV 机器上选择 AV1 QSV，确认不再出现 `format=yuv420p`；如果驱动不支持，应自动回落软件编码并在任务 note 中提示。
+7. 图片扫描能排除 `.webp`，转换后生成 `RIFF....WEBP`，勾选删除时源文件消失，动画 GIF/APNG 帧数保留。
+8. 完成一批视频/图片后，归档日志出现一条记录，包含数量、总耗时、大小变化和逐文件明细；重启服务后记录仍在。
+9. 飞牛模式：侧边栏无“服务器文件/终端”；直连路由重定向；终端 WS 403；授权目录外全部 400。
+10. 飞牛网关：登录后跳转不丢 `/app/<appname>`，刷新 iframe 不白屏。
 
 ## 10. 当前发布产物
 

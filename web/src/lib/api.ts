@@ -15,6 +15,7 @@ import type {
   LogsResult,
   QrLoginPoll,
   QrLoginStart,
+  QueueState,
   RecycleListResult,
   ScanProgress,
   ScanResult,
@@ -138,6 +139,21 @@ export const api = {
     ),
   transcodeClearJobs: () =>
     request<{ removed: number }>('/transcode/jobs', { method: 'DELETE' }),
+  transcodeQueueState: () => request<QueueState>('/transcode/queue'),
+  transcodePauseAll: () =>
+    request<{ paused: boolean; affected: number }>(
+      '/transcode/jobs/pause-all',
+      { method: 'POST' }
+    ),
+  transcodeResumeAll: () =>
+    request<{ paused: boolean; affected: number }>(
+      '/transcode/jobs/resume-all',
+      { method: 'POST' }
+    ),
+  transcodeCancelAll: () =>
+    request<{ canceled: number }>('/transcode/jobs/cancel-all', {
+      method: 'POST',
+    }),
   transcodeStats: () => request<TranscodeStats>('/transcode/stats'),
 
   imageScan: (payload: {
@@ -165,6 +181,19 @@ export const api = {
     }),
   imageClearJobs: () =>
     request<{ removed: number }>('/images/jobs', { method: 'DELETE' }),
+  imageQueueState: () => request<QueueState>('/images/queue'),
+  imagePauseAll: () =>
+    request<{ paused: boolean; affected: number }>('/images/jobs/pause-all', {
+      method: 'POST',
+    }),
+  imageResumeAll: () =>
+    request<{ paused: boolean; affected: number }>('/images/jobs/resume-all', {
+      method: 'POST',
+    }),
+  imageCancelAll: () =>
+    request<{ canceled: number }>('/images/jobs/cancel-all', {
+      method: 'POST',
+    }),
   history: (limit = 100) =>
     request<HistoryRecord[]>(`/history?limit=${limit}`),
   clearHistory: () =>
