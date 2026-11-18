@@ -1,0 +1,17 @@
+{
+  ".url": {
+    "wcdc.Application": {
+      "title": "WCDC",
+      "icon": "images/icon_{0}.png",
+      "type": "iframe",
+      "protocol": "",
+      "gatewayPrefix": "/app/wcdc",
+      "gatewaySocket": "app.sock",
+      "url": "/app/wcdc",
+      "allUsers": false,
+      "control": {
+        "accessPerm": "readonly"
+      }
+    }
+  }
+}

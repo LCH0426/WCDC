@@ -1,0 +1,31 @@
+/target
+/web/node_modules
+/web/dist
+/dist
+/server.log
+/server.err
+/_screens
+*.log
+*.pid
+.DS_Store
+
+# Local runtime state, cookies and debug caches
+*cookies*.txt
+auto-cached.json
+/conversion-history.json
+/volumes.json
+.env
+.env.*
+.claude/
+/tmp/
+
+# Local-only scratch/test scripts
+/scripts-local/
+*.local.*
+*.tmp
+
+# fnOS build artifacts (keep the packaging source, not the built binary/archive)
+/packaging/fnos/*/app/bin/*
+!/packaging/fnos/*/app/bin/.gitkeep
+/packaging/fnos/*/app.tgz
+/packaging/fnos/*/*.fpk

@@ -1,0 +1,8 @@
+{
+  "defaults": {
+    "run-as": "package"
+  },
+  "username": "wcdc",
+  "groupname": "wcdc",
+  "join-groups": ["video", "render"]
+}

@@ -1,0 +1,14 @@
+# Shell scripts and fnOS lifecycle files must stay LF, otherwise they fail on Linux.
+*.sh text eol=lf
+*.bat text eol=crlf
+packaging/fnos/*/cmd/* text eol=lf
+packaging/fnos/*/config/* text eol=lf
+packaging/fnos/*/manifest text eol=lf
+packaging/fnos/*/app/ui/config text eol=lf
+start.sh text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.fpk binary
+*.exe binary

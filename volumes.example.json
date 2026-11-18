@@ -1,0 +1,12 @@
+[
+  {
+    "id": "media",
+    "name": "影视存储盘",
+    "path": "D:/Media"
+  },
+  {
+    "id": "offline",
+    "name": "离线下载盘",
+    "path": "E:/QuarkOffline"
+  }
+]
