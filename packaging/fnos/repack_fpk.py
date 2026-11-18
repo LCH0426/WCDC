@@ -19,6 +19,7 @@ import hashlib
 import io
 import os
 import tarfile
+import time
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ def build_app_tgz(old_app: bytes) -> bytes:
             info = tarfile.TarInfo(name)
             info.type = tarfile.DIRTYPE
             info.mode = 0o755
+            info.mtime = int(time.time())
             info.uid = info.gid = 0
             info.uname = info.gname = "root"
             archive.addfile(info)
@@ -44,6 +46,7 @@ def build_app_tgz(old_app: bytes) -> bytes:
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mode = mode
+            info.mtime = int(time.time())
             info.uid = info.gid = 0
             info.uname = info.gname = "root"
             archive.addfile(info, io.BytesIO(data))
@@ -65,6 +68,7 @@ def build_outer(entries: dict[str, bytes], app_tgz: bytes, manifest: bytes) -> b
             info = tarfile.TarInfo(name)
             info.type = tarfile.DIRTYPE
             info.mode = 0o755
+            info.mtime = int(time.time())
             info.uid = info.gid = 0
             info.uname = info.gname = "root"
             archive.addfile(info)
@@ -73,6 +77,7 @@ def build_outer(entries: dict[str, bytes], app_tgz: bytes, manifest: bytes) -> b
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mode = mode
+            info.mtime = int(time.time())
             info.uid = info.gid = 0
             info.uname = info.gname = "root"
             archive.addfile(info, io.BytesIO(data))
