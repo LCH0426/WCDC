@@ -995,44 +995,53 @@ export default function TranscodePage() {
     }
   }, [recursive, sourceCodec, minSizeMb]);
 
+  const applyRestoredScan = useCallback((restored: ScanResult) => {
+    const available = new Set(restored.files.map((file) => file.path));
+    let nextSelected = new Set(available);
+    try {
+      const raw = window.localStorage.getItem('wcdc.transcode.selected');
+      if (raw) {
+        const stored = JSON.parse(raw) as {
+          directory?: string;
+          paths?: string[];
+        };
+        if (
+          stored.directory === restored.directory &&
+          Array.isArray(stored.paths)
+        ) {
+          nextSelected = new Set(
+            stored.paths.filter((path) => available.has(path))
+          );
+        }
+      }
+    } catch {
+      // Ignore malformed storage.
+    }
+    setScanResult(restored);
+    setScanDir(restored.directory);
+    setSelected(nextSelected);
+    setScanRestored(true);
+    setScanPage(0);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
-    void api
-      .transcodeLastScan()
-      .then((restored) => {
-        if (cancelled || !restored) return;
-        const available = new Set(restored.files.map((file) => file.path));
-        let nextSelected = new Set(available);
-        try {
-          const raw = window.localStorage.getItem('wcdc.transcode.selected');
-          if (raw) {
-            const stored = JSON.parse(raw) as {
-              directory?: string;
-              paths?: string[];
-            };
-            if (
-              stored.directory === restored.directory &&
-              Array.isArray(stored.paths)
-            ) {
-              nextSelected = new Set(
-                stored.paths.filter((path) => available.has(path))
-              );
-            }
-          }
-        } catch {
-          // Ignore malformed storage.
-        }
-        setScanResult(restored);
-        setScanDir(restored.directory);
-        setSelected(nextSelected);
-        setScanRestored(true);
-        setScanPage(0);
-      })
-      .catch(() => undefined);
+    const init = async () => {
+      const progress = await api.transcodeScanProgress().catch(() => null);
+      if (cancelled) return;
+      setScanProgress(progress);
+      if (progress?.running) {
+        setScanning(true);
+        return;
+      }
+      const restored = await api.transcodeLastScan().catch(() => null);
+      if (!cancelled && restored) applyRestoredScan(restored);
+    };
+    void init();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyRestoredScan]);
 
   useEffect(() => {
     if (!scanResult) return;
@@ -1401,21 +1410,27 @@ export default function TranscodePage() {
   useEffect(() => {
     if (!scanning) return;
     let cancelled = false;
-    const tick = () => {
-      void api
-        .transcodeScanProgress()
-        .then((value) => {
-          if (!cancelled) setScanProgress(value);
-        })
-        .catch(() => undefined);
+    const tick = async () => {
+      try {
+        const value = await api.transcodeScanProgress();
+        if (cancelled) return;
+        setScanProgress(value);
+        if (!value.running) {
+          setScanning(false);
+          const restored = await api.transcodeLastScan().catch(() => null);
+          if (!cancelled && restored) applyRestoredScan(restored);
+        }
+      } catch {
+        // Keep polling; the service may be briefly busy.
+      }
     };
-    tick();
-    const timer = window.setInterval(tick, 400);
+    void tick();
+    const timer = window.setInterval(() => void tick(), 400);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [scanning]);
+  }, [scanning, applyRestoredScan]);
 
   const scan = async () => {
     if (!status?.found) {

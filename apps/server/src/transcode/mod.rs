@@ -329,7 +329,18 @@ impl TranscodeService {
         status
     }
 
-    pub async fn scan(&self, request: ScanRequest) -> Result<ScanResult, String> {
+    /// Run the scan in a detached task so switching tabs does not abort it.
+    pub async fn scan(
+        self: &Arc<Self>,
+        request: ScanRequest,
+    ) -> Result<ScanResult, String> {
+        let service = self.clone();
+        tokio::spawn(async move { service.scan_inner(request).await })
+            .await
+            .map_err(|error| format!("视频扫描任务异常退出: {error}"))?
+    }
+
+    async fn scan_inner(&self, request: ScanRequest) -> Result<ScanResult, String> {
         let status = self
             .cached()
             .await

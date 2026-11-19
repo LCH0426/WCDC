@@ -270,6 +270,7 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
   - `ScanResult.skipped_by_size` 返回被大小条件排除的数量。
   - 扫描进度：`ScanTracker` + `GET /api/transcode/scan/progress`，返回 `processed/total/cacheHits/...`；前端每 400ms 轮询。
   - 扫描结果持久化：`<数据目录>/transcode-last-scan.json`，`GET /api/transcode/scan/last` 恢复；前端同时保存选中路径到 localStorage，离开页面再回来不会重新扫描。
+  - 视频扫描同样在后台任务中执行，切换标签/断开请求不会中断；前端重新进入时通过 progress 接口恢复扫描进度。
   - 扫描加速：
     1. 按文件大小预过滤，避免对明显不符合条件的文件启动 ffprobe。
     2. `scan_cache` 跨扫描保留，按 `路径 + 文件大小 + mtime` 复用上次 ffprobe 结果；未变化文件 `cacheHits` 增加、tookMs 接近 0。
