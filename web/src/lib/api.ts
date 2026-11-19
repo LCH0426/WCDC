@@ -121,6 +121,8 @@ export const api = {
     }),
   transcodeScanProgress: () =>
     request<ScanProgress>('/transcode/scan/progress'),
+  transcodeLastScan: () =>
+    request<ScanResult | null>('/transcode/scan/last'),
   transcodeJobs: () => request<JobView[]>('/transcode/jobs'),
   transcodeCreateJobs: (payload: CreateJobsRequest) =>
     request<JobView[]>('/transcode/jobs', {
@@ -165,6 +167,7 @@ export const api = {
       method: 'POST',
       ...jsonBody(payload),
     }),
+  imagesLastScan: () => request<ImageScanResult | null>('/images/scan/last'),
   imageJobs: () => request<ImageJobView[]>('/images/jobs'),
   imageCreateJobs: (payload: CreateImageJobsRequest) =>
     request<ImageJobView[]>('/images/jobs', {

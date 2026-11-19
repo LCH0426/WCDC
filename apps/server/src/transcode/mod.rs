@@ -27,7 +27,7 @@ pub use probe::TranscodeStatus;
 pub use usage::{GpuUsage, TranscodeStats};
 
 pub const SETTING_FFMPEG_PATH: &str = "ffmpeg_path";
-pub const SETTING_PROBE: &str = "transcode_probe";
+pub const SETTING_PROBE: &str = "transcode_probe_v2";
 
 /// Cache fast detection for a short while: probing executes FFmpeg several
 /// times, and the transcode page polls on open rather than continuously.
@@ -141,6 +141,7 @@ impl Default for ScanTracker {
 
 pub struct TranscodeService {
     core: AppCore,
+    data_dir: PathBuf,
     custom: RwLock<Option<String>>,
     persisted: RwLock<Option<TranscodeStatus>>,
     cache: RwLock<Option<CachedStatus>>,
@@ -149,6 +150,7 @@ pub struct TranscodeService {
     scan_tracker: Arc<ScanTracker>,
     jobs: job::JobManager,
     scan_cache: RwLock<HashMap<String, MediaFile>>,
+    last_scan: RwLock<Option<ScanResult>>,
     encoder_checks: RwLock<HashMap<String, (bool, Instant)>>,
     history: Arc<crate::history::HistoryService>,
 }
@@ -161,6 +163,7 @@ struct CachedStatus {
 impl TranscodeService {
     pub fn new(
         core: AppCore,
+        data_dir: PathBuf,
         custom: Option<String>,
         persisted: Option<String>,
         history: Arc<crate::history::HistoryService>,
@@ -177,16 +180,28 @@ impl TranscodeService {
                 }
             }
         });
+        let last_scan = std::fs::read_to_string(data_dir.join("transcode-last-scan.json"))
+            .ok()
+            .and_then(|raw| match serde_json::from_str::<ScanResult>(&raw) {
+                Ok(scan) => Some(scan),
+                Err(error) => {
+                    tracing::warn!(%error, "忽略无法解析的视频扫描缓存");
+                    None
+                }
+            });
+        let jobs = job::JobManager::new(Some(data_dir.join("transcode-jobs.json")));
         Self {
             core,
+            data_dir,
             custom: RwLock::new(custom),
             persisted: RwLock::new(persisted),
             cache: RwLock::new(None),
             probe_lock: Mutex::new(()),
             scan_lock: Mutex::new(()),
             scan_tracker: Arc::new(ScanTracker::new()),
-            jobs: job::JobManager::new(),
+            jobs,
             scan_cache: RwLock::new(HashMap::new()),
+            last_scan: RwLock::new(last_scan),
             encoder_checks: RwLock::new(HashMap::new()),
             history,
         }
@@ -374,7 +389,29 @@ impl TranscodeService {
         for file in &result.files {
             cache.insert(file.path.clone(), file.clone());
         }
+        drop(cache);
+        *self.last_scan.write().await = Some(result.clone());
+        if let Err(error) = self.save_last_scan(&result).await {
+            tracing::warn!(%error, "保存视频扫描缓存失败");
+        }
         Ok(result)
+    }
+
+    pub async fn last_scan(&self) -> Option<ScanResult> {
+        self.last_scan.read().await.clone()
+    }
+
+    async fn save_last_scan(&self, result: &ScanResult) -> Result<(), String> {
+        let json = serde_json::to_string(result)
+            .map_err(|error| format!("序列化视频扫描缓存失败: {error}"))?;
+        let path = self.data_dir.join("transcode-last-scan.json");
+        let temp = self.data_dir.join("transcode-last-scan.json.tmp");
+        tokio::fs::write(&temp, json)
+            .await
+            .map_err(|error| format!("写入视频扫描缓存失败: {error}"))?;
+        tokio::fs::rename(&temp, &path)
+            .await
+            .map_err(|error| format!("替换视频扫描缓存失败: {error}"))
     }
 
     pub async fn scan_progress(&self) -> ScanProgress {
@@ -627,6 +664,10 @@ impl TranscodeService {
 
     pub async fn list_jobs(&self) -> Vec<JobView> {
         self.jobs.list().await
+    }
+
+    pub async fn restore_jobs(&self) -> usize {
+        self.jobs.restore_jobs().await
     }
 
     pub async fn cancel_job(&self, id: &str) -> Result<(), String> {

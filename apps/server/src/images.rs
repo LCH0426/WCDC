@@ -33,7 +33,7 @@ pub struct ImageScanRequest {
     pub min_size_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageFile {
     pub path: String,
@@ -45,7 +45,7 @@ pub struct ImageFile {
     pub height: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageScanResult {
     pub directory: String,
@@ -118,24 +118,54 @@ struct Inner {
     jobs: RwLock<HashMap<String, JobEntry>>,
     events: broadcast::Sender<ImageEvent>,
     paused: watch::Sender<bool>,
+    persist_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedImageJob {
+    id: String,
+    source_path: String,
+    output_path: String,
+    width: u32,
+    height: u32,
+    source_bytes: u64,
+    quality: u8,
+    lossless: bool,
+    delete_original: bool,
+    created_at: i64,
 }
 
 #[derive(Clone)]
 pub struct ImageService {
     inner: Arc<Inner>,
+    data_dir: PathBuf,
+    last_scan: Arc<RwLock<Option<ImageScanResult>>>,
     history: Arc<crate::history::HistoryService>,
 }
 
 impl ImageService {
-    pub fn new(history: Arc<crate::history::HistoryService>) -> Self {
+    pub fn new(history: Arc<crate::history::HistoryService>, data_dir: PathBuf) -> Self {
         let (events, _) = broadcast::channel(512);
         let (paused, _) = watch::channel(false);
+        let last_scan = std::fs::read_to_string(data_dir.join("images-last-scan.json"))
+            .ok()
+            .and_then(|raw| match serde_json::from_str::<ImageScanResult>(&raw) {
+                Ok(scan) => Some(scan),
+                Err(error) => {
+                    tracing::warn!(%error, "忽略无法解析的图片扫描缓存");
+                    None
+                }
+            });
         Self {
             inner: Arc::new(Inner {
                 jobs: RwLock::new(HashMap::new()),
                 events,
                 paused,
+                persist_path: Some(data_dir.join("image-jobs.json")),
             }),
+            data_dir,
+            last_scan: Arc::new(RwLock::new(last_scan)),
             history,
         }
     }
@@ -216,7 +246,7 @@ impl ImageService {
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
-        Ok(ImageScanResult {
+        let result = ImageScanResult {
             directory: directory_path.to_string_lossy().to_string(),
             scanned,
             matched: files.len(),
@@ -224,7 +254,29 @@ impl ImageService {
             files,
             errors,
             took_ms: started.elapsed().as_millis() as u64,
-        })
+        };
+        *self.last_scan.write().await = Some(result.clone());
+        if let Err(error) = self.save_last_scan(&result).await {
+            tracing::warn!(%error, "保存图片扫描缓存失败");
+        }
+        Ok(result)
+    }
+
+    pub async fn last_scan(&self) -> Option<ImageScanResult> {
+        self.last_scan.read().await.clone()
+    }
+
+    async fn save_last_scan(&self, result: &ImageScanResult) -> Result<(), String> {
+        let json = serde_json::to_string(result)
+            .map_err(|error| format!("序列化图片扫描缓存失败: {error}"))?;
+        let path = self.data_dir.join("images-last-scan.json");
+        let temp = self.data_dir.join("images-last-scan.json.tmp");
+        tokio::fs::write(&temp, json)
+            .await
+            .map_err(|error| format!("写入图片扫描缓存失败: {error}"))?;
+        tokio::fs::rename(&temp, &path)
+            .await
+            .map_err(|error| format!("替换图片扫描缓存失败: {error}"))
     }
 
     pub async fn create_jobs(
@@ -295,31 +347,20 @@ impl ImageService {
 
         for (source, output, source_bytes, width, height) in items {
             let id = uuid::Uuid::new_v4().to_string();
-            let view = ImageJobView {
-                id: id.clone(),
-                source_path: source.to_string_lossy().to_string(),
-                source_name: source
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| source.to_string_lossy().to_string()),
-                output_path: output.to_string_lossy().to_string(),
-                source_format: format_label(&source),
+            let view = image_job_view(
+                &id,
+                &source,
+                &output,
                 width,
                 height,
                 source_bytes,
-                output_bytes: 0,
                 quality,
-                lossless: request.lossless,
-                delete_original: request.delete_original,
-                status: "queued".to_string(),
-                progress: 0.0,
-                frames: 1,
-                error: None,
-                note: None,
-                created_at: now_ms(),
-                started_at: None,
-                finished_at: None,
-            };
+                request.lossless,
+                request.delete_original,
+                now_ms(),
+                "queued",
+                None,
+            );
 
             {
                 let mut jobs = self.inner.jobs.write().await;
@@ -405,6 +446,7 @@ impl ImageService {
             });
         }
 
+        self.persist().await;
         Ok(views)
     }
 
@@ -596,18 +638,145 @@ impl ImageService {
     where
         F: FnOnce(&mut JobEntry),
     {
-        let snapshot = {
+        let (snapshot, status_changed) = {
             let mut jobs = self.inner.jobs.write().await;
             let Some(entry) = jobs.get_mut(id) else {
                 return;
             };
+            let before = entry.view.status.clone();
             update(entry);
-            entry.view.clone()
+            (entry.view.clone(), before != entry.view.status)
         };
+        if status_changed {
+            self.persist().await;
+        }
         let _ = self
             .inner
             .events
             .send(ImageEvent::ImageJobUpdated { job: snapshot });
+    }
+
+    async fn persist(&self) {
+        let Some(path) = self.inner.persist_path.as_ref() else {
+            return;
+        };
+        let records: Vec<PersistedImageJob> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter(|(_, entry)| {
+                    entry.view.status == "queued" || entry.view.status == "running"
+                })
+                .map(|(id, entry)| PersistedImageJob {
+                    id: id.clone(),
+                    source_path: entry.view.source_path.clone(),
+                    output_path: entry.view.output_path.clone(),
+                    width: entry.view.width,
+                    height: entry.view.height,
+                    source_bytes: entry.view.source_bytes,
+                    quality: entry.quality,
+                    lossless: entry.lossless,
+                    delete_original: entry.view.delete_original,
+                    created_at: entry.view.created_at,
+                })
+                .collect()
+        };
+        let json = match serde_json::to_string_pretty(&records) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(%error, "序列化图片断点失败");
+                return;
+            }
+        };
+        let temp = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        if let Err(error) = tokio::fs::write(&temp, json).await {
+            tracing::warn!(%error, path = %temp.display(), "写入图片断点失败");
+            return;
+        }
+        if let Err(error) = tokio::fs::rename(&temp, path).await {
+            tracing::warn!(%error, path = %path.display(), "替换图片断点失败");
+        }
+    }
+
+    /// Restore queued/running image jobs after a service restart. Each image is
+    /// atomic: an interrupted image is redone, completed images are skipped.
+    pub async fn restore_jobs(&self) -> usize {
+        let Some(path) = self.inner.persist_path.as_ref() else {
+            return 0;
+        };
+        let Ok(raw) = tokio::fs::read_to_string(path).await else {
+            return 0;
+        };
+        let records: Vec<PersistedImageJob> = match serde_json::from_str(&raw) {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "忽略无法解析的图片断点");
+                return 0;
+            }
+        };
+        let mut restored_ids = Vec::new();
+        for record in records {
+            let source = PathBuf::from(&record.source_path);
+            let output = PathBuf::from(&record.output_path);
+            if !source.is_file() || output.exists() {
+                continue;
+            }
+            let view = image_job_view(
+                &record.id,
+                &source,
+                &output,
+                record.width,
+                record.height,
+                record.source_bytes,
+                record.quality,
+                record.lossless,
+                record.delete_original,
+                record.created_at,
+                "queued",
+                Some("服务重启后自动恢复".to_string()),
+            );
+            let id = record.id;
+            let quality = record.quality;
+            let lossless = record.lossless;
+            {
+                let mut jobs = self.inner.jobs.write().await;
+                jobs.insert(
+                    id.clone(),
+                    JobEntry {
+                        view: view.clone(),
+                        quality,
+                        lossless,
+                        cancel: CancellationToken::new(),
+                    },
+                );
+            }
+            let _ = self
+                .inner
+                .events
+                .send(ImageEvent::ImageJobUpdated { job: view });
+            restored_ids.push(id);
+        }
+
+        if !restored_ids.is_empty() {
+            let semaphore = Arc::new(Semaphore::new(1));
+            for id in &restored_ids {
+                let manager = self.clone();
+                let semaphore = semaphore.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    let Ok(_permit) = semaphore.acquire_owned().await else {
+                        return;
+                    };
+                    manager.run_job(&id).await;
+                });
+            }
+            tracing::info!(count = restored_ids.len(), "restored image jobs after restart");
+        }
+        self.persist().await;
+        restored_ids.len()
     }
 
     pub async fn list(&self) -> Vec<ImageJobView> {
@@ -1115,6 +1284,48 @@ fn encode_animation(
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn image_job_view(
+    id: &str,
+    source: &Path,
+    output: &Path,
+    width: u32,
+    height: u32,
+    source_bytes: u64,
+    quality: u8,
+    lossless: bool,
+    delete_original: bool,
+    created_at: i64,
+    status: &str,
+    note: Option<String>,
+) -> ImageJobView {
+    ImageJobView {
+        id: id.to_string(),
+        source_path: source.to_string_lossy().to_string(),
+        source_name: source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| source.to_string_lossy().to_string()),
+        output_path: output.to_string_lossy().to_string(),
+        source_format: format_label(source),
+        width,
+        height,
+        source_bytes,
+        output_bytes: 0,
+        quality,
+        lossless,
+        delete_original,
+        status: status.to_string(),
+        progress: 0.0,
+        frames: 1,
+        error: None,
+        note,
+        created_at,
+        started_at: None,
+        finished_at: None,
+    }
 }
 
 #[cfg(test)]

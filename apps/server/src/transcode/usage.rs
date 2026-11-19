@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 
 use super::exec;
 #[cfg(all(unix, not(target_os = "macos")))]
+use std::collections::HashMap;
+#[cfg(all(unix, not(target_os = "macos")))]
 use super::gpu;
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +144,94 @@ fn parse_nvidia(text: &str, with_engines: bool) -> Vec<GpuUsage> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+static INTEL_FDINFO: OnceLock<std::sync::Mutex<Option<(Instant, HashMap<String, u64>)>>> =
+    OnceLock::new();
+
+/// Intel i915/xe does not expose `gpu_busy_percent` on most installed kernels.
+/// `/proc/<pid>/fdinfo/<fd>` exposes per-engine busy nanoseconds for processes
+/// that hold a DRM fd; sampling deltas gives a usable utilization value while
+/// transcoding (including our own ffmpeg child).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn sample_intel_fdinfo() -> Option<f64> {
+    let totals = read_intel_engine_totals()?;
+    if totals.is_empty() {
+        return None;
+    }
+    let state = INTEL_FDINFO.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = state.lock().ok()?;
+    let now = Instant::now();
+    let previous = guard.replace((now, totals.clone()));
+    let Some((previous_at, previous_totals)) = previous else {
+        return None;
+    };
+    let elapsed = now.duration_since(previous_at).as_nanos() as f64;
+    if elapsed <= 0.0 {
+        return None;
+    }
+    let mut max_utilization: f64 = 0.0;
+    for (engine, current) in &totals {
+        let previous = previous_totals.get(engine).copied().unwrap_or(0);
+        let delta = current.saturating_sub(previous) as f64;
+        let utilization = (delta / elapsed * 100.0).clamp(0.0, 100.0);
+        max_utilization = max_utilization.max(utilization);
+    }
+    Some(max_utilization)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn read_intel_engine_totals() -> Option<HashMap<String, u64>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut totals: HashMap<String, u64> = HashMap::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let fdinfo = entry.path().join("fdinfo");
+        let Ok(fds) = std::fs::read_dir(fdinfo) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(text) = std::fs::read_to_string(fd.path()) else {
+                continue;
+            };
+            let driver = text
+                .lines()
+                .find_map(|line| line.trim_start().strip_prefix("drm-driver:"))
+                .map(str::trim)
+                .unwrap_or_default();
+            if driver != "i915" && driver != "xe" {
+                continue;
+            }
+            for (engine, busy) in parse_intel_engine_lines(&text) {
+                *totals.entry(engine).or_insert(0) += busy;
+            }
+        }
+    }
+    Some(totals)
+}
+
+#[allow(dead_code)]
+fn parse_intel_engine_lines(text: &str) -> Vec<(String, u64)> {
+    let mut engines = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(engine) = key.trim().strip_prefix("drm-engine-") else {
+            continue;
+        };
+        let busy = value
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        engines.push((engine.to_string(), busy));
+    }
+    engines
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn sample_linux_sysfs(skip_nvidia: bool) -> Vec<GpuUsage> {
     let mut gpus = Vec::new();
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
@@ -169,9 +259,20 @@ fn sample_linux_sysfs(skip_nvidia: bool) -> Vec<GpuUsage> {
         if skip_nvidia && vendor == "nvidia" {
             continue;
         }
-        let utilization = read_number(device.join("gpu_busy_percent"));
-        let memory_used = read_number(device.join("mem_info_vram_used")).map(|value| value as u64);
-        let memory_total = read_number(device.join("mem_info_vram_total")).map(|value| value as u64);
+        let mut source = "sysfs";
+        let mut utilization = read_number(device.join("gpu_busy_percent"));
+        if vendor == "intel" && utilization.is_none() {
+            utilization = sample_intel_fdinfo();
+            if utilization.is_some() {
+                source = "fdinfo";
+            }
+        }
+        let memory_used = read_number(device.join("mem_info_vram_used"))
+            .or_else(|| read_number(device.join("mem_info_gtt_used")))
+            .map(|value| value as u64);
+        let memory_total = read_number(device.join("mem_info_vram_total"))
+            .or_else(|| read_number(device.join("mem_info_gtt_total")))
+            .map(|value| value as u64);
         let temperature = read_temperature(&device);
         let index = name
             .trim_start_matches("card")
@@ -192,7 +293,7 @@ fn sample_linux_sysfs(skip_nvidia: bool) -> Vec<GpuUsage> {
             memory_used_bytes: memory_used,
             memory_total_bytes: memory_total,
             temperature_c: temperature,
-            source: "sysfs".to_string(),
+            source: source.to_string(),
         });
     }
     gpus
@@ -327,5 +428,17 @@ mod tests {
         assert_eq!(parse_number(Some("[N/A]")), None);
         assert_eq!(parse_number(Some("Not Supported")), None);
         assert_eq!(parse_number(Some("12.5")), Some(12.5));
+    }
+
+    #[test]
+    fn parses_intel_fdinfo_engines() {
+        let text = "drm-driver:\ti915\n\
+                    drm-engine-render:\t123456 ns\n\
+                    drm-engine-video:\t98765 ns\n\
+                    drm-engine-video-enhance:\t0 ns\n";
+        let engines = parse_intel_engine_lines(text);
+        assert!(engines.contains(&("render".to_string(), 123456)));
+        assert!(engines.contains(&("video".to_string(), 98765)));
+        assert!(engines.contains(&("video-enhance".to_string(), 0)));
     }
 }

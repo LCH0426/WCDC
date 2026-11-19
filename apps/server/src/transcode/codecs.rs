@@ -38,10 +38,7 @@ const CODECS: &[(&str, &str)] = &[
     ("mpeg2video", "MPEG-2"),
     ("mpeg4", "MPEG-4 Part 2"),
     ("vc1", "VC-1"),
-    ("prores", "Apple ProRes"),
-    ("h263", "H.263"),
     ("mjpeg", "Motion JPEG"),
-    ("theora", "Theora"),
 ];
 
 pub fn build(encoders: &[String], decoders: &[String], gpus: &[GpuInfo]) -> Vec<CodecSupport> {

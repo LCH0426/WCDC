@@ -396,6 +396,18 @@ pub async fn transcode_scan_progress(
     Json(state.transcode.scan_progress().await)
 }
 
+pub async fn transcode_last_scan(
+    State(state): State<AppState>,
+) -> ApiResult<Option<crate::transcode::ScanResult>> {
+    let scan = state.transcode.last_scan().await;
+    if let Some(scan) = &scan {
+        if ensure_allowed_path(&state, Path::new(&scan.directory)).is_err() {
+            return Ok(Json(None));
+        }
+    }
+    Ok(Json(scan))
+}
+
 pub async fn transcode_jobs(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<crate::transcode::JobView>> {
@@ -537,6 +549,18 @@ pub async fn images_scan(
         "image scan finished"
     );
     Ok(Json(result))
+}
+
+pub async fn images_last_scan(
+    State(state): State<AppState>,
+) -> ApiResult<Option<crate::images::ImageScanResult>> {
+    let scan = state.images.last_scan().await;
+    if let Some(scan) = &scan {
+        if ensure_allowed_path(&state, Path::new(&scan.directory)).is_err() {
+            return Ok(Json(None));
+        }
+    }
+    Ok(Json(scan))
 }
 
 pub async fn images_jobs(

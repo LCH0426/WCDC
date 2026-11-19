@@ -7,6 +7,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   MdCancel,
+  MdCheck,
+  MdClose,
   MdContentCopy,
   MdDeleteOutline,
   MdExpandMore,
@@ -34,7 +36,7 @@ import { useApp } from '@/context/app';
 import { api, transcodeEventsUrl } from '@/lib/api';
 import { formatBytes } from '@/lib/format';
 import type {
-  CodecImpls,
+  CodecSupport,
   CreateJobsRequest,
   GpuInfo,
   HwDevice,
@@ -96,6 +98,7 @@ const SOFTWARE_PREFERENCE: Record<string, string[]> = {
 
 const TARGET_CODECS = new Set(['h264', 'hevc', 'av1', 'vp9', 'vp8']);
 const SCAN_PAGE_SIZE = 100;
+const HIDDEN_BUILD_FLAGS = new Set(['vulkan', 'opencl', 'drm']);
 
 type TranscodeTab = 'scan' | 'settings' | 'jobs' | 'capabilities' | 'convert' | 'history';
 
@@ -476,50 +479,188 @@ function DeviceCard({ device }: { device: HwDevice }) {
   );
 }
 
-function CodecCell({
-  impls,
-  usableAccels,
-}: {
-  impls: CodecImpls;
-  usableAccels: Set<string>;
-}) {
-  if (impls.software.length === 0 && impls.hardware.length === 0) {
-    return <span className='text-xs text-slate-400 dark:text-slate-500'>—</span>;
+function codecShortLabel(codec: string): string {
+  if (codec === 'hevc') return 'H.265';
+  if (codec === 'h264') return 'H.264';
+  if (codec === 'mpeg2video') return 'MPEG-2';
+  if (codec === 'mpeg4') return 'MPEG-4';
+  return codec.toUpperCase();
+}
+
+function implMatchesGpu(
+  impl: CodecSupport['encode']['hardware'][number],
+  gpu: GpuInfo
+): boolean {
+  if (impl.accel === 'vaapi') {
+    return gpu.vendor === 'intel' || gpu.vendor === 'amd';
   }
+  if (impl.accel === 'rkmpp' || impl.accel === 'v4l2m2m') {
+    return gpu.vendor === 'arm' || gpu.vendor === 'rockchip';
+  }
+  return impl.vendor === gpu.vendor;
+}
+
+type CapabilityKind = 'encode' | 'decode';
+
+function gpuSupport(
+  codec: CodecSupport,
+  gpu: GpuInfo,
+  kind: CapabilityKind
+): { supported: boolean; names: string[] } {
+  const impls =
+    kind === 'encode' ? codec.encode.hardware : codec.decode.hardware;
+  const names = impls
+    .filter((impl) => implMatchesGpu(impl, gpu))
+    .map((impl) => impl.name);
+  return { supported: names.length > 0, names };
+}
+
+function CapabilityTable({
+  codecs,
+  support,
+}: {
+  codecs: CodecSupport[];
+  support: (codec: CodecSupport, kind: CapabilityKind) => {
+    supported: boolean;
+    names: string[];
+  };
+}) {
   return (
-    <div className='flex flex-wrap gap-1.5'>
-      {impls.hardware.map((impl) => {
-        const usable = usableAccels.has(impl.accel);
-        return (
-          <span
-            key={impl.name}
-            className={clsx(
-              'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium',
-              usable
-                ? 'bg-primary/10 text-primary dark:bg-primary/15 dark:text-primary-300'
-                : 'bg-default-100 text-default-500 opacity-70 dark:bg-white/[0.06] dark:text-default-400'
-            )}
-            title={`${impl.name} · ${impl.vendorLabel}${usable ? '' : ' · 当前不可用'}`}
-          >
-            <VendorLogo vendor={impl.vendor} size='xs' />
-            {impl.name}
-          </span>
-        );
-      })}
-      {impls.software.map((name) => (
-        <span
-          key={name}
-          className='rounded-full bg-default-100 px-2 py-0.5 text-[11px] text-default-600 dark:bg-white/[0.06] dark:text-default-300'
-        >
-          {name}
-        </span>
-      ))}
+    <div className='overflow-x-auto'>
+      <table className='w-full min-w-[520px] table-fixed border-collapse text-center text-xs'>
+        <thead>
+          <tr className='bg-default-50/70 text-[10px] uppercase tracking-wider text-slate-400 dark:bg-white/[0.03]'>
+            <th className='w-16 px-3 py-2 text-left font-semibold'>方向</th>
+            {codecs.map((codec) => (
+              <th key={codec.codec} className='px-1.5 py-2 font-semibold'>
+                {codecShortLabel(codec.codec)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {(['encode', 'decode'] as const).map((kind) => (
+            <tr
+              key={kind}
+              className='border-t border-slate-200/60 dark:border-white/[0.06]'
+            >
+              <td className='px-3 py-2.5 text-left font-medium text-slate-600 dark:text-slate-300'>
+                {kind === 'encode' ? '编码' : '解码'}
+              </td>
+              {codecs.map((codec) => {
+                const result = support(codec, kind);
+                return (
+                  <td key={codec.codec} className='px-1.5 py-2.5'>
+                    <span
+                      className='inline-flex items-center justify-center'
+                      title={
+                        result.supported
+                          ? result.names.join(', ')
+                          : `${codec.label} 不支持`
+                      }
+                    >
+                      {result.supported ? (
+                        <MdCheck size={18} className='text-success' />
+                      ) : (
+                        <MdClose size={18} className='text-danger' />
+                      )}
+                    </span>
+                  </td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function jobStatusChip(status: string) {
-  switch (status) {
+function GpuCapabilityCard({
+  gpu,
+  codecs,
+  devices,
+}: {
+  gpu: GpuInfo;
+  codecs: CodecSupport[];
+  devices: HwDevice[];
+}) {
+  const gpuDevices = devices.filter(
+    (device) =>
+      device.vendor === gpu.vendor ||
+      (device.accel === 'vaapi' &&
+        (gpu.vendor === 'intel' || gpu.vendor === 'amd'))
+  );
+  return (
+    <div className='overflow-hidden rounded-2xl border border-white/60 bg-white/40 dark:border-white/[0.06] dark:bg-white/[0.03]'>
+      <div className='flex flex-wrap items-center gap-2 border-b border-slate-200/60 px-4 py-3 dark:border-white/[0.06]'>
+        <VendorLogo vendor={gpu.vendor} size='sm' />
+        <div className='min-w-0 flex-1'>
+          <div
+            className='truncate text-sm font-semibold text-slate-800 dark:text-slate-100'
+            title={gpu.name}
+          >
+            {gpu.name}
+          </div>
+          <div className='text-[11px] text-slate-500 dark:text-slate-400'>
+            {gpu.vendorLabel}
+            {gpu.bus ? ` · ${gpu.bus}` : ''}
+            {gpu.driver ? ` · 驱动 ${gpu.driver}` : ''}
+          </div>
+        </div>
+        {gpuDevices.map((device) => {
+          const chip = deviceChip(device);
+          return (
+            <span
+              key={device.accel}
+              className={clsx(
+                'rounded-full px-2 py-0.5 text-[10px] font-medium',
+                chip.className
+              )}
+              title={`${device.label} · ${chip.label}`}
+            >
+              {device.label} · {chip.label}
+            </span>
+          );
+        })}
+      </div>
+      <CapabilityTable
+        codecs={codecs}
+        support={(codec, kind) => gpuSupport(codec, gpu, kind)}
+      />
+    </div>
+  );
+}
+
+function SoftwareCapabilityCard({ codecs }: { codecs: CodecSupport[] }) {
+  return (
+    <div className='overflow-hidden rounded-2xl border border-white/60 bg-white/40 dark:border-white/[0.06] dark:bg-white/[0.03]'>
+      <div className='flex items-center gap-2 border-b border-slate-200/60 px-4 py-3 dark:border-white/[0.06]'>
+        <span className='flex h-8 w-8 items-center justify-center rounded-lg bg-default-100 text-default-600 dark:bg-white/[0.06] dark:text-default-300'>
+          <MdMemory size={18} />
+        </span>
+        <div>
+          <div className='text-sm font-semibold text-slate-800 dark:text-slate-100'>
+            CPU 软件
+          </div>
+          <div className='text-[11px] text-slate-500 dark:text-slate-400'>
+            不依赖显卡的软件编解码
+          </div>
+        </div>
+      </div>
+      <CapabilityTable
+        codecs={codecs}
+        support={(codec, kind) => {
+          const names =
+            kind === 'encode' ? codec.encode.software : codec.decode.software;
+          return { supported: names.length > 0, names };
+        }}
+      />
+    </div>
+  );
+}
+
+function jobStatusChip(status: string) {  switch (status) {
     case 'running':
       return { label: '转码中', className: 'bg-primary/10 text-primary' };
     case 'queued':
@@ -815,15 +956,98 @@ export default function TranscodePage() {
     }
   }, [scanDir]);
 
-  const [recursive, setRecursive] = useState(true);
-  const [sourceCodec, setSourceCodec] = useState('');
-  const [minSizeMb, setMinSizeMb] = useState('');
+  const [recursive, setRecursive] = useState(() => {
+    try {
+      return window.localStorage.getItem('wcdc.transcode.recursive') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [sourceCodec, setSourceCodec] = useState(() => {
+    try {
+      return window.localStorage.getItem('wcdc.transcode.sourceCodec') ?? '';
+    } catch {
+      return '';
+    }
+  });
+  const [minSizeMb, setMinSizeMb] = useState(() => {
+    try {
+      return window.localStorage.getItem('wcdc.transcode.minSizeMb') ?? '';
+    } catch {
+      return '';
+    }
+  });
   const [scanning, setScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgress | null>(null);
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [scanRestored, setScanRestored] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanPage, setScanPage] = useState(0);
   const [browseTarget, setBrowseTarget] = useState<'scan' | 'output' | null>(null);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('wcdc.transcode.recursive', String(recursive));
+      window.localStorage.setItem('wcdc.transcode.sourceCodec', sourceCodec);
+      window.localStorage.setItem('wcdc.transcode.minSizeMb', minSizeMb);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [recursive, sourceCodec, minSizeMb]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .transcodeLastScan()
+      .then((restored) => {
+        if (cancelled || !restored) return;
+        const available = new Set(restored.files.map((file) => file.path));
+        let nextSelected = new Set(available);
+        try {
+          const raw = window.localStorage.getItem('wcdc.transcode.selected');
+          if (raw) {
+            const stored = JSON.parse(raw) as {
+              directory?: string;
+              paths?: string[];
+            };
+            if (
+              stored.directory === restored.directory &&
+              Array.isArray(stored.paths)
+            ) {
+              nextSelected = new Set(
+                stored.paths.filter((path) => available.has(path))
+              );
+            }
+          }
+        } catch {
+          // Ignore malformed storage.
+        }
+        setScanResult(restored);
+        setScanDir(restored.directory);
+        setSelected(nextSelected);
+        setScanRestored(true);
+        setScanPage(0);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!scanResult) return;
+    try {
+      window.localStorage.setItem(
+        'wcdc.transcode.selected',
+        JSON.stringify({
+          directory: scanResult.directory,
+          paths: [...selected],
+        })
+      );
+    } catch {
+      // Selection may exceed localStorage quota; the scan result still works.
+    }
+  }, [scanResult, selected]);
 
   const [targetCodec, setTargetCodec] = useState('hevc');
   const [encoderChoice, setEncoderChoice] = useState('auto');
@@ -1030,6 +1254,14 @@ export default function TranscodePage() {
       .map((codec) => ({ value: codec.codec, label: codecLabel(codec.codec) }));
   }, [status]);
 
+  const capabilityCodecs = useMemo(
+    () =>
+      (status?.codecs ?? []).filter((codec) =>
+        ['h264', 'hevc', 'av1', 'vp9', 'vp8'].includes(codec.codec)
+      ),
+    [status]
+  );
+
   useEffect(() => {
     if (!status || codecOptions.length === 0) return;
     if (!codecOptions.some((option) => option.value === targetCodec)) {
@@ -1208,6 +1440,7 @@ export default function TranscodePage() {
       });
       setScanResult(result);
       setSelected(new Set(result.files.map((file) => file.path)));
+      setScanRestored(false);
       setScanPage(0);
       if (result.errors.length > 0) {
         toast.error(`扫描完成，但有 ${result.errors.length} 个文件读取失败`);
@@ -1860,6 +2093,11 @@ export default function TranscodePage() {
                       <span className='rounded-full bg-primary/10 px-2 py-0.5 text-[11px] text-primary'>
                         已选 {selected.size} / {scanResult.files.length}
                       </span>
+                      {scanRestored && (
+                        <span className='rounded-full bg-default-100 px-2 py-0.5 text-[10px] text-default-500 dark:bg-white/[0.06] dark:text-default-300'>
+                          已恢复上次扫描
+                        </span>
+                      )}
                     </div>
                     <div className='flex items-center gap-2'>
                       <Button size='sm' variant='light' onPress={toggleAll}>
@@ -2487,15 +2725,20 @@ export default function TranscodePage() {
                 </div>
                 {status.buildConfig.length > 0 && (
                   <div className='flex flex-wrap gap-1.5'>
-                    {status.buildConfig.map((flag) => (
-                      <span
-                        key={flag}
-                        title={flag}
-                        className='rounded-full bg-default-100 px-2 py-0.5 text-[10px] text-default-600 dark:bg-white/[0.06] dark:text-default-300'
-                      >
-                        {flag.replace('--enable-', '')}
-                      </span>
-                    ))}
+                    {status.buildConfig
+                      .filter(
+                        (flag) =>
+                          !HIDDEN_BUILD_FLAGS.has(flag.replace('--enable-', ''))
+                      )
+                      .map((flag) => (
+                        <span
+                          key={flag}
+                          title={flag}
+                          className='rounded-full bg-default-100 px-2 py-0.5 text-[10px] text-default-600 dark:bg-white/[0.06] dark:text-default-300'
+                        >
+                          {flag.replace('--enable-', '')}
+                        </span>
+                      ))}
                   </div>
                 )}
                 {status.error && (
@@ -2545,53 +2788,25 @@ export default function TranscodePage() {
                 <section>
                   <SectionHeader
                     icon={<MdMovieFilter size={18} />}
-                    title='编解码支持'
-                    subtitle='软件实现与硬件实现分开列出；灰色硬件项表示当前设备不可用或未通过自检'
+                    title='显卡编解码支持'
+                    subtitle='按显示卡分类；绿勾表示支持，红叉表示不支持；CPU 软件支持单独列出'
                   />
-                  <div className='overflow-hidden rounded-2xl border border-white/60 dark:border-white/[0.06]'>
-                    <div className='overflow-x-auto'>
-                      <table className='w-full min-w-[720px] border-collapse text-left text-sm'>
-                        <thead>
-                          <tr className='border-b border-slate-200/70 text-[11px] uppercase tracking-wider text-slate-400 dark:border-white/[0.07]'>
-                            <th className='px-4 py-3 font-semibold'>格式</th>
-                            <th className='px-4 py-3 font-semibold'>解码</th>
-                            <th className='px-4 py-3 font-semibold'>编码</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {status.codecs.map((codec) => {
-                            const empty =
-                              codec.decode.software.length === 0 &&
-                              codec.decode.hardware.length === 0 &&
-                              codec.encode.software.length === 0 &&
-                              codec.encode.hardware.length === 0;
-                            return (
-                              <tr
-                                key={codec.codec}
-                                className={clsx(
-                                  'border-b border-slate-200/50 align-top last:border-0 dark:border-white/[0.05]',
-                                  empty && 'opacity-50'
-                                )}
-                              >
-                                <td className='whitespace-nowrap px-4 py-3'>
-                                  <div className='font-medium text-slate-800 dark:text-slate-100'>
-                                    {codec.label}
-                                  </div>
-                                  <div className='text-[10px] text-slate-400'>{codec.codec}</div>
-                                </td>
-                                <td className='px-4 py-3'>
-                                  <CodecCell impls={codec.decode} usableAccels={usableAccels} />
-                                </td>
-                                <td className='px-4 py-3'>
-                                  <CodecCell impls={codec.encode} usableAccels={usableAccels} />
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
+                  <div className='grid gap-4 xl:grid-cols-2'>
+                    {status.gpus.map((gpu) => (
+                      <GpuCapabilityCard
+                        key={`${gpu.vendor}-${gpu.name}-${gpu.bus ?? ''}`}
+                        gpu={gpu}
+                        codecs={capabilityCodecs}
+                        devices={status.devices}
+                      />
+                    ))}
+                    <SoftwareCapabilityCard codecs={capabilityCodecs} />
                   </div>
+                  {status.gpus.length === 0 && (
+                    <div className='mt-3 rounded-2xl bg-white/40 p-4 text-xs text-slate-500 dark:bg-white/[0.03] dark:text-slate-400'>
+                      未能枚举显卡，仅显示 CPU 软件编解码支持。
+                    </div>
+                  )}
                 </section>
 
               </div>

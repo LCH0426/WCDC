@@ -19,7 +19,7 @@ const VIDEO_EXTENSIONS: &[&str] = &[
 const SCAN_CONCURRENCY: usize = 4;
 const PROBE_TIMEOUT_SECS: u64 = 20;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaFile {
     pub path: String,
@@ -41,7 +41,7 @@ pub struct MediaFile {
     pub subtitle_count: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResult {
     pub directory: String,

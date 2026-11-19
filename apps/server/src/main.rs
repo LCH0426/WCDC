@@ -73,11 +73,23 @@ async fn main() -> Result<()> {
     let history = history::HistoryService::new(&config.data_dir);
     let transcode = Arc::new(transcode::TranscodeService::new(
         core.clone(),
+        config.data_dir.clone(),
         ffmpeg_setting,
         persisted_probe,
         history.clone(),
     ));
-    let images = Arc::new(images::ImageService::new(history.clone()));
+    let images = Arc::new(images::ImageService::new(
+        history.clone(),
+        config.data_dir.clone(),
+    ));
+    let restored_jobs = transcode.restore_jobs().await;
+    if restored_jobs > 0 {
+        tracing::info!(count = restored_jobs, "restored transcode jobs after restart");
+    }
+    let restored_images = images.restore_jobs().await;
+    if restored_images > 0 {
+        tracing::info!(count = restored_images, "restored image jobs after restart");
+    }
 
     let password_hash = core
         .get_setting(auth::AUTH_SETTING_KEY)
@@ -345,6 +357,7 @@ fn build_router(state: AppState) -> Router {
             "/api/transcode/scan/progress",
             get(api::transcode_scan_progress),
         )
+        .route("/api/transcode/scan/last", get(api::transcode_last_scan))
         .route(
             "/api/transcode/jobs",
             get(api::transcode_jobs)
@@ -375,6 +388,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/transcode/events", get(api::transcode_events))
         .route("/api/transcode/stats", get(api::transcode_stats))
         .route("/api/images/scan", post(api::images_scan))
+        .route("/api/images/scan/last", get(api::images_last_scan))
         .route(
             "/api/images/jobs",
             get(api::images_jobs)

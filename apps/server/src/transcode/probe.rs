@@ -500,6 +500,20 @@ fn parse_build_config(line: &str) -> Vec<String> {
     flags
 }
 
+/// Accelerators that can actually be used by this page's encoder pipeline.
+/// Decode-only or unsupported APIs (Vulkan/OpenCL/DRM/d3d12va/nvdec/...) are
+/// intentionally hidden from the capability cards.
+const DEVICE_ACCELS: &[&str] = &[
+    "vaapi",
+    "qsv",
+    "nvenc",
+    "amf",
+    "mf",
+    "videotoolbox",
+    "rkmpp",
+    "v4l2m2m",
+];
+
 fn build_devices(
     hwaccels: &[String],
     encoders: &[String],
@@ -517,6 +531,7 @@ fn build_devices(
 
     let mut seen = HashSet::new();
     names.retain(|name| seen.insert(name.clone()));
+    names.retain(|name| DEVICE_ACCELS.contains(&name.as_str()));
     names.sort_by_key(|name| accel_order(name));
 
     let render = first_render_device(gpus);
@@ -525,14 +540,6 @@ fn build_devices(
         .map(|accel| {
             let vendor = device_vendor(accel, gpus);
             let (available, device, note) = availability(accel, gpus, render.as_deref());
-            let note = if matches!(accel.as_str(), "d3d12va" | "vulkan" | "opencl") {
-                Some(
-                    "当前版本未接入硬件帧上传，不能直接用于本页转码；仅作为能力信息展示"
-                        .to_string(),
-                )
-            } else {
-                note
-            };
             HwDevice {
                 accel: accel.clone(),
                 label: accel_label(accel).to_string(),

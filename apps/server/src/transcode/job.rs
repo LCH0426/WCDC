@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, watch, RwLock, Semaphore};
@@ -60,6 +60,17 @@ pub enum TranscodeEvent {
     JobsCleared,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedJob {
+    id: String,
+    media: MediaFile,
+    options: ResolvedOptions,
+    output: String,
+    ffmpeg: String,
+    created_at: i64,
+}
+
 struct JobEntry {
     view: JobView,
     media: MediaFile,
@@ -74,6 +85,7 @@ struct Inner {
     jobs: RwLock<HashMap<String, JobEntry>>,
     events: broadcast::Sender<TranscodeEvent>,
     paused: watch::Sender<bool>,
+    persist_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -82,7 +94,7 @@ pub struct JobManager {
 }
 
 impl JobManager {
-    pub fn new() -> Self {
+    pub fn new(persist_path: Option<PathBuf>) -> Self {
         let (events, _) = broadcast::channel(512);
         let (paused, _) = watch::channel(false);
         Self {
@@ -90,6 +102,7 @@ impl JobManager {
                 jobs: RwLock::new(HashMap::new()),
                 events,
                 paused,
+                persist_path,
             }),
         }
     }
@@ -98,8 +111,129 @@ impl JobManager {
         self.inner.events.subscribe()
     }
 
-    pub async fn list(&self) -> Vec<JobView> {
-        let jobs = self.inner.jobs.read().await;
+    async fn persist(&self) {
+        let Some(path) = self.inner.persist_path.as_ref() else {
+            return;
+        };
+        let records: Vec<PersistedJob> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter(|(_, entry)| {
+                    entry.view.status == "queued" || entry.view.status == "running"
+                })
+                .map(|(id, entry)| PersistedJob {
+                    id: id.clone(),
+                    media: entry.media.clone(),
+                    options: entry.options.clone(),
+                    output: entry.view.output_path.clone(),
+                    ffmpeg: entry.ffmpeg.to_string_lossy().to_string(),
+                    created_at: entry.view.created_at,
+                })
+                .collect()
+        };
+        let json = match serde_json::to_string_pretty(&records) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(%error, "序列化转码断点失败");
+                return;
+            }
+        };
+        let temp = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            path.file_name().map(|name| name.to_string_lossy()).unwrap_or_default(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        if let Err(error) = tokio::fs::write(&temp, json).await {
+            tracing::warn!(%error, path = %temp.display(), "写入转码断点失败");
+            return;
+        }
+        if let Err(error) = tokio::fs::rename(&temp, path).await {
+            tracing::warn!(%error, path = %path.display(), "替换转码断点失败");
+        }
+    }
+
+    /// Restore queued/running jobs after a service restart. Interrupted ffmpeg
+    /// files start over from the beginning; already completed files are not
+    /// repeated because their jobs are not in the persisted active set.
+    pub async fn restore_jobs(&self) -> usize {
+        let Some(path) = self.inner.persist_path.as_ref() else {
+            return 0;
+        };
+        let Ok(raw) = tokio::fs::read_to_string(path).await else {
+            return 0;
+        };
+        let records: Vec<PersistedJob> = match serde_json::from_str(&raw) {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "忽略无法解析的转码断点");
+                return 0;
+            }
+        };
+        let mut restored_ids = Vec::new();
+        for record in records {
+            let source = PathBuf::from(&record.media.path);
+            let output = PathBuf::from(&record.output);
+            let ffmpeg = PathBuf::from(&record.ffmpeg);
+            if !source.is_file() || !ffmpeg.is_file() {
+                continue;
+            }
+            if output != source && output.exists() {
+                // Output already exists: the job most likely finished before
+                // the shutdown but its terminal status was not persisted.
+                continue;
+            }
+            let view = job_view(
+                &record.id,
+                &record.media,
+                &record.options,
+                &output,
+                record.created_at,
+                "queued",
+                Some("服务重启后自动恢复，中断的文件会重新开始".to_string()),
+            );
+            let id = record.id;
+            {
+                let mut jobs = self.inner.jobs.write().await;
+                jobs.insert(
+                    id.clone(),
+                    JobEntry {
+                        view: view.clone(),
+                        media: record.media,
+                        options: record.options,
+                        cancel: CancellationToken::new(),
+                        ffmpeg,
+                        pid: None,
+                        suspended: false,
+                    },
+                );
+            }
+            let _ = self
+                .inner
+                .events
+                .send(TranscodeEvent::JobUpdated { job: view });
+            restored_ids.push(id);
+        }
+
+        if !restored_ids.is_empty() {
+            let semaphore = Arc::new(Semaphore::new(1));
+            for id in &restored_ids {
+                let manager = self.clone();
+                let semaphore = semaphore.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    let Ok(_permit) = semaphore.acquire_owned().await else {
+                        return;
+                    };
+                    manager.run_job(&id).await;
+                });
+            }
+            tracing::info!(count = restored_ids.len(), "restored transcode jobs after restart");
+        }
+        self.persist().await;
+        restored_ids.len()
+    }
+
+    pub async fn list(&self) -> Vec<JobView> {        let jobs = self.inner.jobs.read().await;
         let mut views: Vec<JobView> = jobs.values().map(|entry| entry.view.clone()).collect();
         views.sort_by(|left, right| {
             right
@@ -300,48 +434,15 @@ impl JobManager {
 
         for (media, options, output) in items {
             let id = uuid::Uuid::new_v4().to_string();
-            let estimated_bytes = command::estimated_bytes(&options, &media);
-            let view = JobView {
-                id: id.clone(),
-                source_path: media.path.clone(),
-                source_name: media.name.clone(),
-                output_path: output.to_string_lossy().to_string(),
-                source_codec: media.video_codec.clone(),
-                source_width: media.width,
-                source_height: media.height,
-                source_bytes: media.size_bytes,
-                source_bitrate_kbps: media.video_bitrate_bps / 1000,
-                target_codec: options.target_codec.clone(),
-                container: options.container.clone(),
-                resolution: options.resolution_label.clone(),
-                encoder: options.encoder.clone(),
-                hardware: options.hardware,
-                accel: options.accel.clone(),
-                vendor: options.vendor.clone(),
-                bitrate_kbps: options.bitrate_kbps,
-                quality: options.crf.map(|value| format!("CRF {value}")),
-                audio: match options.audio {
-                    AudioMode::Copy => "copy".to_string(),
-                    AudioMode::Aac => "aac".to_string(),
-                    AudioMode::None => "none".to_string(),
-                },
-                delete_original: options.delete_original,
-                status: "queued".to_string(),
-                progress: 0.0,
-                duration_ms: media.duration_ms,
-                out_time_ms: 0,
-                speed: None,
-                fps: None,
-                eta_seconds: None,
-                output_bytes: 0,
-                current_bitrate_kbps: None,
-                estimated_bytes,
-                error: None,
-                note: None,
-                created_at: now_ms(),
-                started_at: None,
-                finished_at: None,
-            };
+            let view = job_view(
+                &id,
+                &media,
+                &options,
+                &output,
+                now_ms(),
+                "queued",
+                None,
+            );
 
             {
                 let mut jobs = self.inner.jobs.write().await;
@@ -377,6 +478,7 @@ impl JobManager {
             });
         }
 
+        self.persist().await;
         Ok(views)
     }
 
@@ -767,14 +869,18 @@ impl JobManager {
     where
         F: FnOnce(&mut JobEntry),
     {
-        let snapshot = {
+        let (snapshot, status_changed) = {
             let mut jobs = self.inner.jobs.write().await;
             let Some(entry) = jobs.get_mut(id) else {
                 return;
             };
+            let before = entry.view.status.clone();
             update(entry);
-            entry.view.clone()
+            (entry.view.clone(), before != entry.view.status)
         };
+        if status_changed {
+            self.persist().await;
+        }
         let _ = self
             .inner
             .events
@@ -1049,6 +1155,59 @@ mod process_control {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn job_view(
+    id: &str,
+    media: &MediaFile,
+    options: &ResolvedOptions,
+    output: &Path,
+    created_at: i64,
+    status: &str,
+    note: Option<String>,
+) -> JobView {
+    JobView {
+        id: id.to_string(),
+        source_path: media.path.clone(),
+        source_name: media.name.clone(),
+        output_path: output.to_string_lossy().to_string(),
+        source_codec: media.video_codec.clone(),
+        source_width: media.width,
+        source_height: media.height,
+        source_bytes: media.size_bytes,
+        source_bitrate_kbps: media.video_bitrate_bps / 1000,
+        target_codec: options.target_codec.clone(),
+        container: options.container.clone(),
+        resolution: options.resolution_label.clone(),
+        encoder: options.encoder.clone(),
+        hardware: options.hardware,
+        accel: options.accel.clone(),
+        vendor: options.vendor.clone(),
+        bitrate_kbps: options.bitrate_kbps,
+        quality: options.crf.map(|value| format!("CRF {value}")),
+        audio: match options.audio {
+            AudioMode::Copy => "copy".to_string(),
+            AudioMode::Aac => "aac".to_string(),
+            AudioMode::None => "none".to_string(),
+        },
+        delete_original: options.delete_original,
+        status: status.to_string(),
+        progress: 0.0,
+        duration_ms: media.duration_ms,
+        out_time_ms: 0,
+        speed: None,
+        fps: None,
+        eta_seconds: None,
+        output_bytes: 0,
+        current_bitrate_kbps: None,
+        estimated_bytes: command::estimated_bytes(options, media),
+        error: None,
+        note,
+        created_at,
+        started_at: None,
+        finished_at: None,
+    }
 }
 
 fn human_bytes(bytes: u64) -> String {

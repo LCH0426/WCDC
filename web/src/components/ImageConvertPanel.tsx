@@ -287,13 +287,89 @@ export function ImageConvertPanel() {
     }
   }, [scanDir]);
 
-  const [recursive, setRecursive] = useState(true);
-  const [minSizeMb, setMinSizeMb] = useState('');
+  const [recursive, setRecursive] = useState(() => {
+    try {
+      return window.localStorage.getItem('wcdc.convert.recursive') !== 'false';
+    } catch {
+      return true;
+    }
+  });
+  const [minSizeMb, setMinSizeMb] = useState(() => {
+    try {
+      return window.localStorage.getItem('wcdc.convert.minSizeMb') ?? '';
+    } catch {
+      return '';
+    }
+  });
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<ImageScanResult | null>(null);
+  const [scanRestored, setScanRestored] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [page, setPage] = useState(0);
   const [browseTarget, setBrowseTarget] = useState<'scan' | 'output' | null>(null);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('wcdc.convert.recursive', String(recursive));
+      window.localStorage.setItem('wcdc.convert.minSizeMb', minSizeMb);
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [recursive, minSizeMb]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .imagesLastScan()
+      .then((restored) => {
+        if (cancelled || !restored) return;
+        const available = new Set(restored.files.map((file) => file.path));
+        let nextSelected = new Set(available);
+        try {
+          const raw = window.localStorage.getItem('wcdc.convert.selected');
+          if (raw) {
+            const stored = JSON.parse(raw) as {
+              directory?: string;
+              paths?: string[];
+            };
+            if (
+              stored.directory === restored.directory &&
+              Array.isArray(stored.paths)
+            ) {
+              nextSelected = new Set(
+                stored.paths.filter((path) => available.has(path))
+              );
+            }
+          }
+        } catch {
+          // Ignore malformed storage.
+        }
+        setScanResult(restored);
+        setScanDir(restored.directory);
+        setSelected(nextSelected);
+        setScanRestored(true);
+        setPage(0);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!scanResult) return;
+    try {
+      window.localStorage.setItem(
+        'wcdc.convert.selected',
+        JSON.stringify({
+          directory: scanResult.directory,
+          paths: [...selected],
+        })
+      );
+    } catch {
+      // The scan result remains usable even if selection is too large.
+    }
+  }, [scanResult, selected]);
 
   const [quality, setQuality] = useState(80);
   const [lossless, setLossless] = useState(false);
@@ -415,6 +491,7 @@ export function ImageConvertPanel() {
       });
       setScanResult(result);
       setSelected(new Set(result.files.map((file) => file.path)));
+      setScanRestored(false);
       setPage(0);
       if (result.errors.length > 0) {
         toast.error(`扫描完成，但有 ${result.errors.length} 个图片读取失败`);
@@ -807,6 +884,11 @@ export function ImageConvertPanel() {
               <span className='rounded-full bg-primary/10 px-2 py-0.5 text-[11px] text-primary'>
                 已选 {selected.size} / {scanResult.files.length}
               </span>
+              {scanRestored && (
+                <span className='rounded-full bg-default-100 px-2 py-0.5 text-[10px] text-default-500 dark:bg-white/[0.06] dark:text-default-300'>
+                  已恢复上次扫描
+                </span>
+              )}
             </div>
             <Button size='sm' variant='light' onPress={toggleAll}>
               {allSelected ? '清空选择' : '全选'}

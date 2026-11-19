@@ -46,7 +46,7 @@ npm run build          # tsc --noEmit && vite build
 cd ..
 cargo run -p wcdc-server
 
-# 后端测试（当前 36 个测试，含图片转换和 QSV 参数测试）
+# 后端测试（当前 37 个测试，含图片转换和 QSV 参数测试）
 cargo test -p wcdc-server
 ```
 
@@ -269,13 +269,13 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
   - `ScanRequest.min_size_bytes` / 前端 `minSizeBytes`：只处理大于该大小的文件；默认 0/空 = 不限制。
   - `ScanResult.skipped_by_size` 返回被大小条件排除的数量。
   - 扫描进度：`ScanTracker` + `GET /api/transcode/scan/progress`，返回 `processed/total/cacheHits/...`；前端每 400ms 轮询。
+  - 扫描结果持久化：`<数据目录>/transcode-last-scan.json`，`GET /api/transcode/scan/last` 恢复；前端同时保存选中路径到 localStorage，离开页面再回来不会重新扫描。
   - 扫描加速：
     1. 按文件大小预过滤，避免对明显不符合条件的文件启动 ffprobe。
     2. `scan_cache` 跨扫描保留，按 `路径 + 文件大小 + mtime` 复用上次 ffprobe 结果；未变化文件 `cacheHits` 增加、tookMs 接近 0。
     3. ffprobe 并发数按 CPU 核数动态调整，范围 4–12（`available_parallelism().clamp(4, 12)`）。
   - 任务创建复用同一份 `scan_cache` 的媒体信息，避免再次 ffprobe。
-- 命令构造：`apps/server/src/transcode/command.rs`
-  - QSV 编码器（尤其是 `av1_qsv`）的像素格式必须是 `nv12` / `p010le`，不能是 `yuv420p`。之前 `Error while opening encoder ... av1_qsv` 的根因就是统一 `format=yuv420p`。现在 QSV 分支输出 `format=nv12`。
+- 命令构造：`apps/server/src/transcode/command.rs`  - QSV 编码器（尤其是 `av1_qsv`）的像素格式必须是 `nv12` / `p010le`，不能是 `yuv420p`。之前 `Error while opening encoder ... av1_qsv` 的根因就是统一 `format=yuv420p`。现在 QSV 分支输出 `format=nv12`。
   - CPU 核心限制：`cpu_threads` 在输入前作为解码线程数写入一次，软件编码器在 `-c:v` 后再写入一次；硬件编码器不追加 encoder threads。
   - 硬件编码器打开失败（stderr 包含 `Error while opening encoder` 等）且没有输出时，自动切换到目标编码的软件编码器重试一次。用于驱动声明了 `av1_qsv` 但 GPU 实际不支持 AV1 编码的情况。
   - 创建任务前会先做一次 `self_test::verify_encoder` 单帧预检（按 encoder/accel/device/ffmpeg 缓存 5 分钟）。预检失败会直接改用软件编码，不再先启动一个注定失败的硬件任务。
@@ -284,10 +284,15 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
 - 任务：`apps/server/src/transcode/job.rs`
   - 临时文件 `.part`，成功后替换；勾选删除原文件时复用原文件名并在成功后删除源文件。
   - 进度、ETA、速度、GPU 利用率通过 SSE `/api/transcode/events`。
-  - 任务只在内存中，服务重启后清空。
   - 全部暂停：Unix 用 `SIGSTOP`，Windows 用 `NtSuspendProcess`；全部继续用 `SIGCONT` / `NtResumeProcess`。排队任务通过 `watch` 暂停调度。
   - API：`POST /api/transcode/jobs/pause-all`、`/resume-all`、`/cancel-all`；`GET /api/transcode/queue` 返回 `{paused,running,queued}`。
+  - 断点恢复：排队/运行中的任务写入 `<数据目录>/transcode-jobs.json`，重启后自动重新入队。已完成的文件不会重复；中断中的单个文件会从开头重新转码（没有做分片级续传）。
   - 暂停状态是全局的，取消全部会同时清除暂停状态。
+- 能力页：
+  - 只展示能用于本页编码的加速器（vaapi/qsv/nvenc/amf/mf/videotoolbox/rkmpp/v4l2m2m）；Vulkan/OpenCL/DRM/d3d12va/nvdec 等不再显示。
+  - 编解码矩阵按显卡分类，行是编码/解码，列固定为 H.264/H.265/AV1/VP9/VP8；绿勾支持、红叉不支持，CPU 软件支持单独一张表。
+  - 能力列表不再包含 Apple ProRes、H.263、Theora。
+- Intel Linux GPU 使用率：优先读 `gpu_busy_percent`；i915/xe 没有该文件时扫描 `/proc/*/fdinfo` 的 `drm-engine-*` busy 纳秒并做差分，来源标记为 `fdinfo`。
 
 ## 7. 图片转 WebP 实现
 
@@ -308,6 +313,8 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
 - 图片任务与 ffmpeg 无关，即使没有 ffmpeg 也能使用“格式转换”标签。
 - 全部完成后前端汇总源大小、输出大小和节省比例/字节数。
 - 全部暂停/继续/取消：`POST /api/images/jobs/pause-all`、`/resume-all`、`/cancel-all`；`GET /api/images/queue`。暂停只阻止后续文件启动，正在编码的当前图片会完成。
+- 扫描结果持久化：`<数据目录>/images-last-scan.json`，`GET /api/images/scan/last`；前端选中项存 localStorage。
+- 断点恢复：活动图片任务写入 `<数据目录>/image-jobs.json`，重启后自动恢复；已完成/输出已存在的图片跳过。
 
 ### 7.1 转换归档日志
 
@@ -319,7 +326,7 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
   - `GET /api/history?limit=200`
   - `DELETE /api/history`
 - 前端：`web/src/components/HistoryPanel.tsx`，转码页“归档日志”标签；即使没有 ffmpeg 也可查看。
-- 任务列表本身仍然只在内存中；归档是跨重启保留的批次摘要。
+- 任务列表会通过断点文件恢复；归档是跨重启保留的批次摘要。恢复的任务不会重新挂上原来的批次监控，极端情况下这一批可能没有新的归档记录。
 
 **许可证提醒**：`zenwebp 0.4.6` 的许可证是 `AGPL-3.0-only OR LicenseRef-Imazen-Commercial`。当前项目是 MIT；将 zenwebp 静态链接进发布二进制并分发时，需要评估 AGPL 合规或购买商业授权。不要在未确认的情况下移除本说明。
 
@@ -355,10 +362,13 @@ cd .. && cargo test -p wcdc-server
 5. 强制选择设备不支持的硬件编码器（例如 N 卡机器选 `av1_amf`），任务创建后应直接显示软件编码器（如 `libsvtav1`），不应先产生一次硬件打开失败。
 6. 图片页在暂停状态下新建任务应保持排队，继续后完成。
 7. QSV 机器上选择 AV1 QSV，确认不再出现 `format=yuv420p`；如果驱动不支持，任务创建阶段就应改为软件编码。
-8. 图片扫描能排除 `.webp`，转换后生成 `RIFF....WEBP`，勾选删除时源文件消失，动画 GIF/APNG 帧数保留。
-9. 完成一批视频/图片后，归档日志出现一条记录，包含数量、总耗时、大小变化和逐文件明细；重启服务后记录仍在。
-10. 飞牛模式：侧边栏无“服务器文件/终端”；直连路由重定向；终端 WS 403；授权目录外全部 400。
-11. 飞牛网关：登录后跳转不丢 `/app/<appname>`，刷新 iframe 不白屏。
+8. 能力页不显示 Vulkan/OpenCL/DRM；编解码矩阵只有 H.264/H.265/AV1/VP9/VP8，按显卡分组，绿勾/红叉；Intel Linux 转码时 GPU 使用率不应一直为 —。
+9. 图片扫描能排除 `.webp`，转换后生成 `RIFF....WEBP`，勾选删除时源文件消失，动画 GIF/APNG 帧数保留。
+10. 视频/图片扫描完成后离开页面再回来，结果和选择应恢复；重启服务后 `/api/*/scan/last` 仍返回上次结果。
+11. 运行中的视频/图片任务重启服务后应自动恢复；已完成文件不重复，中断文件从头重做。
+12. 完成一批视频/图片后，归档日志出现一条记录，包含数量、总耗时、大小变化和逐文件明细；重启服务后记录仍在。
+13. 飞牛模式：侧边栏无“服务器文件/终端”；直连路由重定向；终端 WS 403；授权目录外全部 400。
+14. 飞牛网关：登录后跳转不丢 `/app/<appname>`，刷新 iframe 不白屏。
 
 ## 10. 当前发布产物
 
