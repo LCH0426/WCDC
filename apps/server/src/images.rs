@@ -7,7 +7,7 @@ use std::time::Instant;
 use futures_util::stream::{self, StreamExt};
 use image::{AnimationDecoder, DynamicImage};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, watch, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 use zenwebp::mux::{AnimationConfig, AnimationEncoder};
@@ -55,6 +55,22 @@ pub struct ImageScanResult {
     pub files: Vec<ImageFile>,
     pub errors: Vec<String>,
     pub took_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageScanProgress {
+    pub running: bool,
+    pub directory: String,
+    pub processed: usize,
+    pub total: usize,
+    pub matched: usize,
+    pub errors: usize,
+    pub skipped_by_size: usize,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub took_ms: u64,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -141,6 +157,8 @@ pub struct ImageService {
     inner: Arc<Inner>,
     data_dir: PathBuf,
     last_scan: Arc<RwLock<Option<ImageScanResult>>>,
+    scan_lock: Arc<Mutex<()>>,
+    scan_progress: Arc<RwLock<ImageScanProgress>>,
     history: Arc<crate::history::HistoryService>,
 }
 
@@ -166,6 +184,8 @@ impl ImageService {
             }),
             data_dir,
             last_scan: Arc::new(RwLock::new(last_scan)),
+            scan_lock: Arc::new(Mutex::new(())),
+            scan_progress: Arc::new(RwLock::new(ImageScanProgress::default())),
             history,
         }
     }
@@ -174,7 +194,27 @@ impl ImageService {
         self.inner.events.subscribe()
     }
 
+    /// Run the scan in a detached task so switching tabs does not abort it.
+    /// Progress and the final result are stored in the service.
     pub async fn scan(&self, request: ImageScanRequest) -> Result<ImageScanResult, String> {
+        let service = self.clone();
+        tokio::spawn(async move { service.scan_inner(request).await })
+            .await
+            .map_err(|error| format!("图片扫描任务异常退出: {error}"))?
+    }
+
+    async fn scan_inner(&self, request: ImageScanRequest) -> Result<ImageScanResult, String> {
+        let _guard = self.scan_lock.lock().await;
+        self.reset_scan_progress(&request.directory).await;
+        let result = self.scan_work(request).await;
+        match &result {
+            Ok(scan) => self.finish_scan_progress(scan).await,
+            Err(error) => self.fail_scan_progress(error).await,
+        }
+        result
+    }
+
+    async fn scan_work(&self, request: ImageScanRequest) -> Result<ImageScanResult, String> {
         let started = Instant::now();
         let directory = request.directory.trim();
         if directory.is_empty() {
@@ -221,12 +261,22 @@ impl ImageService {
         paths.sort();
 
         let scanned = paths.len();
-        let results = stream::iter(paths.into_iter().map(|path| async move {
-            let probe_path = path.clone();
-            let result = tokio::task::spawn_blocking(move || image_metadata(&probe_path))
-                .await
-                .unwrap_or_else(|error| Err(format!("读取图片信息失败: {error}")));
-            (path, result)
+        {
+            let mut progress = self.scan_progress.write().await;
+            progress.total = scanned;
+            progress.skipped_by_size = skipped_by_size;
+        }
+        let progress_state = self.scan_progress.clone();
+        let results = stream::iter(paths.into_iter().map(|path| {
+            let progress = progress_state.clone();
+            async move {
+                let probe_path = path.clone();
+                let result = tokio::task::spawn_blocking(move || image_metadata(&probe_path))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("读取图片信息失败: {error}")));
+                progress.write().await.processed += 1;
+                (path, result)
+            }
         }))
         .buffer_unordered(SCAN_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -260,6 +310,41 @@ impl ImageService {
             tracing::warn!(%error, "保存图片扫描缓存失败");
         }
         Ok(result)
+    }
+
+    async fn reset_scan_progress(&self, directory: &str) {
+        let mut progress = self.scan_progress.write().await;
+        *progress = ImageScanProgress {
+            running: true,
+            directory: directory.trim().to_string(),
+            started_at: now_ms(),
+            ..ImageScanProgress::default()
+        };
+    }
+
+    async fn finish_scan_progress(&self, result: &ImageScanResult) {
+        let mut progress = self.scan_progress.write().await;
+        progress.running = false;
+        progress.directory = result.directory.clone();
+        progress.processed = result.scanned;
+        progress.total = result.scanned;
+        progress.matched = result.matched;
+        progress.errors = result.errors.len();
+        progress.skipped_by_size = result.skipped_by_size;
+        progress.took_ms = result.took_ms;
+        progress.finished_at = Some(now_ms());
+        progress.error = None;
+    }
+
+    async fn fail_scan_progress(&self, error: &str) {
+        let mut progress = self.scan_progress.write().await;
+        progress.running = false;
+        progress.finished_at = Some(now_ms());
+        progress.error = Some(error.to_string());
+    }
+
+    pub async fn scan_progress(&self) -> ImageScanProgress {
+        self.scan_progress.read().await.clone()
     }
 
     pub async fn last_scan(&self) -> Option<ImageScanResult> {

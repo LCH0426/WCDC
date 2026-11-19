@@ -314,6 +314,7 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
 - 全部完成后前端汇总源大小、输出大小和节省比例/字节数。
 - 全部暂停/继续/取消：`POST /api/images/jobs/pause-all`、`/resume-all`、`/cancel-all`；`GET /api/images/queue`。暂停只阻止后续文件启动，正在编码的当前图片会完成。
 - 扫描结果持久化：`<数据目录>/images-last-scan.json`，`GET /api/images/scan/last`；前端选中项存 localStorage。
+- 图片扫描进度：`GET /api/images/scan/progress`；扫描在后台任务中执行，切换标签/断开请求不会中断，完成后写入 last-scan。
 - 断点恢复：活动图片任务写入 `<数据目录>/image-jobs.json`，重启后自动恢复；已完成/输出已存在的图片跳过。
 
 ### 7.1 转换归档日志

@@ -26,6 +26,7 @@ import type {
   CreateImageJobsRequest,
   ImageEvent,
   ImageJobView,
+  ImageScanProgress,
   ImageScanResult,
   TranscodeStats,
 } from '@/lib/types';
@@ -302,6 +303,7 @@ export function ImageConvertPanel() {
     }
   });
   const [scanning, setScanning] = useState(false);
+  const [scanProgress, setScanProgress] = useState<ImageScanProgress | null>(null);
   const [scanResult, setScanResult] = useState<ImageScanResult | null>(null);
   const [scanRestored, setScanRestored] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -317,44 +319,78 @@ export function ImageConvertPanel() {
     }
   }, [recursive, minSizeMb]);
 
+  const applyRestoredScan = useCallback((restored: ImageScanResult) => {
+    const available = new Set(restored.files.map((file) => file.path));
+    let nextSelected = new Set(available);
+    try {
+      const raw = window.localStorage.getItem('wcdc.convert.selected');
+      if (raw) {
+        const stored = JSON.parse(raw) as {
+          directory?: string;
+          paths?: string[];
+        };
+        if (
+          stored.directory === restored.directory &&
+          Array.isArray(stored.paths)
+        ) {
+          nextSelected = new Set(
+            stored.paths.filter((path) => available.has(path))
+          );
+        }
+      }
+    } catch {
+      // Ignore malformed storage.
+    }
+    setScanResult(restored);
+    setScanDir(restored.directory);
+    setSelected(nextSelected);
+    setScanRestored(true);
+    setPage(0);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
-    void api
-      .imagesLastScan()
-      .then((restored) => {
-        if (cancelled || !restored) return;
-        const available = new Set(restored.files.map((file) => file.path));
-        let nextSelected = new Set(available);
-        try {
-          const raw = window.localStorage.getItem('wcdc.convert.selected');
-          if (raw) {
-            const stored = JSON.parse(raw) as {
-              directory?: string;
-              paths?: string[];
-            };
-            if (
-              stored.directory === restored.directory &&
-              Array.isArray(stored.paths)
-            ) {
-              nextSelected = new Set(
-                stored.paths.filter((path) => available.has(path))
-              );
-            }
-          }
-        } catch {
-          // Ignore malformed storage.
-        }
-        setScanResult(restored);
-        setScanDir(restored.directory);
-        setSelected(nextSelected);
-        setScanRestored(true);
-        setPage(0);
-      })
-      .catch(() => undefined);
+    const init = async () => {
+      const progress = await api.imagesScanProgress().catch(() => null);
+      if (cancelled) return;
+      setScanProgress(progress);
+      if (progress?.running) {
+        setScanning(true);
+        return;
+      }
+      const restored = await api.imagesLastScan().catch(() => null);
+      if (!cancelled && restored) applyRestoredScan(restored);
+    };
+    void init();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyRestoredScan]);
+
+  useEffect(() => {
+    if (!scanning) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const progress = await api.imagesScanProgress();
+        if (cancelled) return;
+        setScanProgress(progress);
+        if (!progress.running) {
+          setScanning(false);
+          const restored = await api.imagesLastScan().catch(() => null);
+          if (!cancelled && restored) applyRestoredScan(restored);
+        }
+      } catch {
+        // Keep polling; the service may be briefly busy.
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [scanning, applyRestoredScan]);
 
   useEffect(() => {
     if (!scanResult) return;
@@ -480,6 +516,7 @@ export function ImageConvertPanel() {
       return;
     }
     setScanning(true);
+    setScanProgress(null);
     try {
       const result = await api.imageScan({
         directory: scanDir.trim(),
@@ -731,6 +768,37 @@ export function ImageConvertPanel() {
                 : '支持 JPEG、PNG、APNG、GIF、BMP、TIFF、ICO、TGA、QOI、HDR、EXR 等'}
             </div>
           </div>
+
+          {scanning && (
+            <div className='mt-3 rounded-xl bg-primary/[0.04] px-3 py-2 dark:bg-primary/[0.08]'>
+              <div className='flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-300'>
+                <span className='font-medium text-primary'>正在分析图片信息…</span>
+                <span>
+                  {scanProgress
+                    ? `${scanProgress.processed} / ${scanProgress.total || '…'}`
+                    : '准备中'}
+                </span>
+              </div>
+              <div className='mt-2 h-1.5 overflow-hidden rounded-full bg-primary/10'>
+                <div
+                  className='h-full rounded-full bg-gradient-to-r from-primary-300 to-primary transition-all duration-300'
+                  style={{
+                    width: `${
+                      scanProgress && scanProgress.total > 0
+                        ? Math.min(
+                            100,
+                            (scanProgress.processed / scanProgress.total) * 100
+                          )
+                        : 5
+                    }%`,
+                  }}
+                />
+              </div>
+              <div className='mt-1.5 text-[10px] text-slate-400 dark:text-slate-500'>
+                扫描在服务器后台继续，切换标签不会中断。
+              </div>
+            </div>
+          )}
 
           {scanResult && scanResult.errors.length > 0 && (
             <details className='mt-3'>

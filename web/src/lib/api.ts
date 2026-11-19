@@ -9,6 +9,7 @@ import type {
   FileBrowseResult,
   HistoryRecord,
   ImageJobView,
+  ImageScanProgress,
   ImageScanResult,
   JobView,
   ListResult,
@@ -168,6 +169,8 @@ export const api = {
       ...jsonBody(payload),
     }),
   imagesLastScan: () => request<ImageScanResult | null>('/images/scan/last'),
+  imagesScanProgress: () =>
+    request<ImageScanProgress>('/images/scan/progress'),
   imageJobs: () => request<ImageJobView[]>('/images/jobs'),
   imageCreateJobs: (payload: CreateImageJobsRequest) =>
     request<ImageJobView[]>('/images/jobs', {

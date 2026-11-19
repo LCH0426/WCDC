@@ -390,6 +390,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/images/scan", post(api::images_scan))
         .route("/api/images/scan/last", get(api::images_last_scan))
         .route(
+            "/api/images/scan/progress",
+            get(api::images_scan_progress),
+        )
+        .route(
             "/api/images/jobs",
             get(api::images_jobs)
                 .post(api::images_create_jobs)

@@ -563,6 +563,12 @@ pub async fn images_last_scan(
     Ok(Json(scan))
 }
 
+pub async fn images_scan_progress(
+    State(state): State<AppState>,
+) -> Json<crate::images::ImageScanProgress> {
+    Json(state.images.scan_progress().await)
+}
+
 pub async fn images_jobs(
     State(state): State<AppState>,
 ) -> ApiResult<Vec<crate::images::ImageJobView>> {

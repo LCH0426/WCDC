@@ -425,6 +425,20 @@ export interface ImageScanResult {
   tookMs: number;
 }
 
+export interface ImageScanProgress {
+  running: boolean;
+  directory: string;
+  processed: number;
+  total: number;
+  matched: number;
+  errors: number;
+  skippedBySize: number;
+  startedAt: number;
+  finishedAt?: number | null;
+  tookMs: number;
+  error?: string | null;
+}
+
 export interface ImageJobView {
   id: string;
   sourcePath: string;
