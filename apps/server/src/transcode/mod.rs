@@ -149,6 +149,7 @@ pub struct TranscodeService {
     scan_tracker: Arc<ScanTracker>,
     jobs: job::JobManager,
     scan_cache: RwLock<HashMap<String, MediaFile>>,
+    encoder_checks: RwLock<HashMap<String, (bool, Instant)>>,
     history: Arc<crate::history::HistoryService>,
 }
 
@@ -186,6 +187,7 @@ impl TranscodeService {
             scan_tracker: Arc::new(ScanTracker::new()),
             jobs: job::JobManager::new(),
             scan_cache: RwLock::new(HashMap::new()),
+            encoder_checks: RwLock::new(HashMap::new()),
             history,
         }
     }
@@ -379,6 +381,61 @@ impl TranscodeService {
         self.scan_tracker.snapshot().await
     }
 
+    /// FFmpeg advertises hardware encoders even when the GPU/driver only
+    /// supports decoding that codec. Run a one-frame encode before choosing
+    /// hardware, so an unsupported AV1 QSV/VAAPI encoder never becomes a job.
+    async fn hardware_encoder_works(
+        &self,
+        ffmpeg: &str,
+        options: &command::ResolvedOptions,
+    ) -> bool {
+        if !options.hardware {
+            return true;
+        }
+        let Some(accel) = options.accel.as_deref() else {
+            return true;
+        };
+        let encoder = options.encoder.as_str();
+        let key = format!(
+            "{}|{}|{}|{}",
+            ffmpeg,
+            encoder,
+            accel,
+            options.device.as_deref().unwrap_or("")
+        );
+        {
+            let checks = self.encoder_checks.read().await;
+            if let Some((ok, at)) = checks.get(&key) {
+                if at.elapsed() < Duration::from_secs(300) {
+                    return *ok;
+                }
+            }
+        }
+        let result = self_test::verify_encoder(
+            Path::new(ffmpeg),
+            accel,
+            encoder,
+            options.device.as_deref(),
+        )
+        .await;
+        let ok = result.is_ok();
+        if let Err(error) = &result {
+            tracing::info!(
+                encoder,
+                accel,
+                error = %error,
+                "hardware encoder preflight failed; software fallback will be used"
+            );
+        } else {
+            tracing::debug!(encoder, accel, "hardware encoder preflight passed");
+        }
+        self.encoder_checks
+            .write()
+            .await
+            .insert(key, (ok, Instant::now()));
+        ok
+    }
+
     pub async fn create_jobs(&self, request: CreateJobsRequest) -> Result<Vec<JobView>, String> {
         let status = self
             .cached()
@@ -451,7 +508,23 @@ impl TranscodeService {
                     .map_err(|error| format!("无法读取 {}: {error}", path.display()))?
                     .ok_or_else(|| format!("不是有效的视频文件：{file}"))?,
             };
-            let options = command::resolve(&media, &settings, &status)?;
+            let mut options = command::resolve(&media, &settings, &status)?;
+            if options.hardware && !self.hardware_encoder_works(&ffmpeg, &options).await {
+                if let Some(fallback) = options.software_fallback.clone() {
+                    tracing::info!(
+                        source = %media.path,
+                        hardware = %options.encoder,
+                        software = %fallback,
+                        "hardware encoder missing codec support; switching to software"
+                    );
+                    options = options.switch_to_software(fallback);
+                } else {
+                    return Err(format!(
+                        "{} 的硬件编码器 {} 无法在当前设备上初始化，且没有可用的软件编码器",
+                        media.name, options.encoder
+                    ));
+                }
+            }
             let output = command::output_path_reserving(&path, &options, &reserved)?;
             tracing::debug!(
                 source = %media.path,

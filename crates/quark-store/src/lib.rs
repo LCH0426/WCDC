@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{FromRow, Row, SqlitePool};
 use thiserror::Error;
 
@@ -98,6 +98,8 @@ impl Store {
             .map_err(|err| StoreError::Path(err.to_string()))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("wal_autocheckpoint", "4000")
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(10));
         let pool = SqlitePoolOptions::new()

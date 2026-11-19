@@ -46,13 +46,15 @@ npm run build          # tsc --noEmit && vite build
 cd ..
 cargo run -p wcdc-server
 
-# 后端测试（当前 35 个测试，含图片转换和 QSV 参数测试）
+# 后端测试（当前 36 个测试，含图片转换和 QSV 参数测试）
 cargo test -p wcdc-server
 ```
 
 默认监听 `127.0.0.1:8787`，数据目录为系统默认的 `wcdc` 目录。首次访问需要注册站点密码。
 
 CI 中必须先构建前端再编译 Rust：`web/dist` 被 gitignore，`rust-embed` 在干净 checkout 中找不到它会导致 Rust 任务失败。`.github/workflows/ci.yml` 的 rust job 已加入 `npm ci && npm run build`。
+
+SQLite：`crates/quark-store/src/lib.rs` 使用 WAL + `synchronous=NORMAL` + `wal_autocheckpoint=4000`。如果日志出现 `INSERT INTO transfer_parts ... elapsed=3.6s`，优先检查数据目录所在磁盘（HDD 自旋、NAS 网络盘、WAL checkpoint）和并发传输数；不要把它误判为 SQL 写错。分片完成仍会逐片落库，这是断点续传所需的持久化。
 
 开发时可用独立数据目录和端口，避免污染用户数据：
 
@@ -276,6 +278,8 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
   - QSV 编码器（尤其是 `av1_qsv`）的像素格式必须是 `nv12` / `p010le`，不能是 `yuv420p`。之前 `Error while opening encoder ... av1_qsv` 的根因就是统一 `format=yuv420p`。现在 QSV 分支输出 `format=nv12`。
   - CPU 核心限制：`cpu_threads` 在输入前作为解码线程数写入一次，软件编码器在 `-c:v` 后再写入一次；硬件编码器不追加 encoder threads。
   - 硬件编码器打开失败（stderr 包含 `Error while opening encoder` 等）且没有输出时，自动切换到目标编码的软件编码器重试一次。用于驱动声明了 `av1_qsv` 但 GPU 实际不支持 AV1 编码的情况。
+  - 创建任务前会先做一次 `self_test::verify_encoder` 单帧预检（按 encoder/accel/device/ffmpeg 缓存 5 分钟）。预检失败会直接改用软件编码，不再先启动一个注定失败的硬件任务。
+  - 典型情况：Intel 核显只支持 AV1 解码、FFmpeg 仍报告 `av1_qsv`/`av1_vaapi`，预检会识别并回退到 `libsvtav1`。
   - CRF/CQ/global_quality/qp 映射见 `append_quality_args`。
 - 任务：`apps/server/src/transcode/job.rs`
   - 临时文件 `.part`，成功后替换；勾选删除原文件时复用原文件名并在成功后删除源文件。
@@ -348,12 +352,13 @@ cd .. && cargo test -p wcdc-server
 2. 扫描视频设置最小大小，确认 `skippedBySize` 和界面提示正确；扫描过程中进度条/已分析数量更新；第二次扫描 `cacheHits > 0` 且明显更快。
 3. 软件转码设置 CPU 核心限制，确认 ffmpeg 命令包含两处 `-threads` 且任务成功。
 4. 转码中点击“全部暂停”，进度应停止；点击“全部继续”后继续；“全部取消”后所有活动任务变为已取消。
-5. 图片页在暂停状态下新建任务应保持排队，继续后完成。
-6. QSV 机器上选择 AV1 QSV，确认不再出现 `format=yuv420p`；如果驱动不支持，应自动回落软件编码并在任务 note 中提示。
-7. 图片扫描能排除 `.webp`，转换后生成 `RIFF....WEBP`，勾选删除时源文件消失，动画 GIF/APNG 帧数保留。
-8. 完成一批视频/图片后，归档日志出现一条记录，包含数量、总耗时、大小变化和逐文件明细；重启服务后记录仍在。
-9. 飞牛模式：侧边栏无“服务器文件/终端”；直连路由重定向；终端 WS 403；授权目录外全部 400。
-10. 飞牛网关：登录后跳转不丢 `/app/<appname>`，刷新 iframe 不白屏。
+5. 强制选择设备不支持的硬件编码器（例如 N 卡机器选 `av1_amf`），任务创建后应直接显示软件编码器（如 `libsvtav1`），不应先产生一次硬件打开失败。
+6. 图片页在暂停状态下新建任务应保持排队，继续后完成。
+7. QSV 机器上选择 AV1 QSV，确认不再出现 `format=yuv420p`；如果驱动不支持，任务创建阶段就应改为软件编码。
+8. 图片扫描能排除 `.webp`，转换后生成 `RIFF....WEBP`，勾选删除时源文件消失，动画 GIF/APNG 帧数保留。
+9. 完成一批视频/图片后，归档日志出现一条记录，包含数量、总耗时、大小变化和逐文件明细；重启服务后记录仍在。
+10. 飞牛模式：侧边栏无“服务器文件/终端”；直连路由重定向；终端 WS 403；授权目录外全部 400。
+11. 飞牛网关：登录后跳转不丢 `/app/<appname>`，刷新 iframe 不白屏。
 
 ## 10. 当前发布产物
 

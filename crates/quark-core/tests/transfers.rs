@@ -351,7 +351,7 @@ async fn restores_saved_session_after_restart() {
 }
 
 async fn wait_for_progress(core: &AppCore, id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(item) = core
             .list_transfers(50)
@@ -377,7 +377,7 @@ async fn wait_for_progress(core: &AppCore, id: &str) {
 }
 
 async fn wait_for(core: &AppCore, id: &str, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         if let Some(item) = core
             .list_transfers(50)

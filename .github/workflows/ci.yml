@@ -27,6 +27,8 @@ jobs:
           npm ci
           npm run build
       - name: Test protocol/core
+        env:
+          RUST_TEST_THREADS: 1
         run: cargo test -p quark-protocol -p quark-core
       - name: Test server
         run: cargo test -p wcdc-server
