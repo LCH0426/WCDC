@@ -1,5 +1,5 @@
 appname=wcdc
-version=0.1.0
+version=0.1.1
 display_name=WCDC
 desc=夸克网盘网页客户端，本地视频硬件转码、图片 WebP 转换与转换归档。
 source=thirdparty
@@ -11,4 +11,4 @@ desktop_applaunchname=wcdc.Application
 ctl_stop=true
 os_min_version=1.1.3100
 disable_authorization_path=false
-changelog=WCDC 版本：统一网关访问、夸克文件管理、下载、本地视频硬件转码、图片 WebP 转换和归档日志。
+changelog=0.1.1：新增扫描进度与缓存、扫描结果持久化、任务断点恢复、暂停/继续/全部取消、图片 WebP 转换、归档日志、显卡能力矩阵与 Intel GPU 使用率修复。
