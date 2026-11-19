@@ -761,7 +761,8 @@ function JobRow({
         title={`${job.sourcePath} → ${job.outputPath}`}
       >
         {codecLabel(job.sourceCodec)} {job.sourceWidth}x{job.sourceHeight} →{' '}
-        {codecLabel(job.targetCodec)} {job.resolution} · {job.encoder} ·{' '}
+        {codecLabel(job.targetCodec)} {job.resolution}
+        {job.frameRate ? ` · ${job.frameRate} fps` : ''} · {job.encoder} ·{' '}
         {job.quality ?? `${job.bitrateKbps} kbps`}
       </div>
 
@@ -1064,6 +1065,8 @@ export default function TranscodePage() {
   const [resolution, setResolution] = useState('source');
   const [customWidth, setCustomWidth] = useState('');
   const [customHeight, setCustomHeight] = useState('');
+  const [frameRate, setFrameRate] = useState('source');
+  const [customFps, setCustomFps] = useState('');
   const [bitrateMode, setBitrateMode] = useState('source');
   const [bitrateMbps, setBitrateMbps] = useState('4');
   const [crf, setCrf] = useState(23);
@@ -1503,6 +1506,19 @@ export default function TranscodePage() {
       toast.error('自定义分辨率需要填写宽或高');
       return;
     }
+    const fps =
+      frameRate === 'source'
+        ? undefined
+        : frameRate === 'custom'
+          ? Number(customFps)
+          : Number(frameRate);
+    if (
+      fps !== undefined &&
+      (!Number.isFinite(fps) || fps < 1 || fps > 240)
+    ) {
+      toast.error('帧率应在 1–240 之间');
+      return;
+    }
     if (bitrateMode === 'custom' && !(Number(bitrateMbps) > 0)) {
       toast.error('请填写有效的目标码率');
       return;
@@ -1536,6 +1552,7 @@ export default function TranscodePage() {
         resolution === 'custom' && customHeight.trim()
           ? Number(customHeight)
           : undefined,
+      fps,
       bitrateMode,
       bitrateKbps:
         bitrateMode === 'custom'
@@ -2347,6 +2364,33 @@ export default function TranscodePage() {
                         placeholder='留空自动'
                       />
                     </div>
+                  )}
+
+                  <SelectField
+                    label='帧率'
+                    value={frameRate}
+                    onChange={setFrameRate}
+                    options={[
+                      { value: 'source', label: '原始（默认，保持源帧率）' },
+                      { value: '24', label: '固定 24 fps' },
+                      { value: '25', label: '固定 25 fps' },
+                      { value: '30', label: '固定 30 fps' },
+                      { value: '60', label: '固定 60 fps' },
+                      { value: 'custom', label: '自定义帧率' },
+                    ]}
+                    hint='固定帧率会通过 fps 滤镜重采样；默认不改变源帧率'
+                  />
+                  {frameRate === 'custom' && (
+                    <Input
+                      size='sm'
+                      label='自定义帧率（fps）'
+                      type='number'
+                      min={1}
+                      max={240}
+                      value={customFps}
+                      onValueChange={setCustomFps}
+                      placeholder='例如 23.976'
+                    />
                   )}
 
                   <div className='grid gap-3 sm:grid-cols-2'>

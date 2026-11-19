@@ -340,6 +340,7 @@ export interface JobView {
   targetCodec: string;
   container: string;
   resolution: string;
+  frameRate?: number | null;
   encoder: string;
   hardware: boolean;
   accel?: string | null;
@@ -394,6 +395,7 @@ export interface CreateJobsRequest {
   resolution: string;
   width?: number;
   height?: number;
+  fps?: number;
   bitrateMode: string;
   bitrateKbps?: number;
   crf?: number;

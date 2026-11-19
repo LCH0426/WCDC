@@ -23,6 +23,9 @@ pub struct TranscodeSettings {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// Fixed output frame rate; None/0 keeps the source rate.
+    #[serde(default)]
+    pub fps: Option<f64>,
     #[serde(default = "default_bitrate_mode")]
     pub bitrate_mode: String,
     #[serde(default)]
@@ -76,6 +79,8 @@ pub struct ResolvedOptions {
     pub device: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default)]
+    pub fps: Option<f64>,
     pub resolution_label: String,
     pub bitrate_kbps: u64,
     pub crf: Option<u8>,
@@ -142,6 +147,16 @@ pub fn resolve(
     };
     let audio = resolve_audio(media, &container, &settings.audio);
 
+    let fps = match settings.fps {
+        Some(value) if value > 0.0 => {
+            if !value.is_finite() || !(1.0..=240.0).contains(&value) {
+                return Err("帧率必须在 1–240 之间".to_string());
+            }
+            Some(value)
+        }
+        _ => None,
+    };
+
     let hdr_requested = settings.hdr_to_sdr.unwrap_or(true);
     let tonemap = media.is_hdr && hdr_requested;
     if tonemap && !status.build_config.iter().any(|flag| flag == "--enable-libzimg") {
@@ -162,6 +177,7 @@ pub fn resolve(
         width,
         height,
         resolution_label,
+        fps,
         bitrate_kbps,
         crf,
         audio,
@@ -765,6 +781,9 @@ fn build_filters(media: &MediaFile, options: &ResolvedOptions) -> Vec<String> {
     if let Some(scale) = scale_filter(options) {
         filters.push(scale);
     }
+    if let Some(fps) = options.fps {
+        filters.push(fps_filter(fps));
+    }
     if options.accel.as_deref() == Some("vaapi") {
         filters.push("format=nv12".to_string());
         filters.push("hwupload".to_string());
@@ -785,6 +804,20 @@ fn scale_filter(options: &ResolvedOptions) -> Option<String> {
         (Some(width), None) => Some(format!("scale={width}:-2:flags=lanczos")),
         (None, Some(height)) => Some(format!("scale=-2:{height}:flags=lanczos")),
         (None, None) => None,
+    }
+}
+
+fn fps_filter(fps: f64) -> String {
+    if (fps - 23.976).abs() < 0.001 {
+        "fps=24000/1001".to_string()
+    } else if (fps - 29.97).abs() < 0.001 {
+        "fps=30000/1001".to_string()
+    } else if (fps - 59.94).abs() < 0.001 {
+        "fps=60000/1001".to_string()
+    } else if fps.fract().abs() < 0.001 {
+        format!("fps={:.0}", fps)
+    } else {
+        format!("fps={fps:.3}")
     }
 }
 
@@ -822,6 +855,7 @@ mod tests {
             resolution: "source".to_string(),
             width: None,
             height: None,
+            fps: None,
             bitrate_mode: "source".to_string(),
             bitrate_kbps: None,
             crf: None,
@@ -971,6 +1005,31 @@ mod tests {
         let resolved = resolve(&media(), &options, &status).unwrap();
         assert!(resolved.height.is_none());
         assert_eq!(resolved.resolution_label, "原始（不放大）");
+    }
+
+    #[test]
+    fn builds_fps_filter_when_fixed() {
+        let status = status_with("hevc_qsv", "qsv");
+        let mut options = settings();
+        options.encoder = "libx265".to_string();
+        options.fps = Some(24.0);
+        let resolved = resolve(&media(), &options, &status).unwrap();
+        assert_eq!(resolved.fps, Some(24.0));
+        let args = build_args(&media(), &resolved, Path::new("/tmp/out.mp4.part"));
+        let flat: Vec<String> = args
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect();
+        assert!(flat.iter().any(|value| value.contains("fps=24")));
+
+        options.fps = Some(23.976);
+        let resolved = resolve(&media(), &options, &status).unwrap();
+        let args = build_args(&media(), &resolved, Path::new("/tmp/out.mp4.part"));
+        let flat: Vec<String> = args
+            .iter()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect();
+        assert!(flat.iter().any(|value| value.contains("fps=24000/1001")));
     }
 
     #[test]

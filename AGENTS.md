@@ -46,7 +46,7 @@ npm run build          # tsc --noEmit && vite build
 cd ..
 cargo run -p wcdc-server
 
-# 后端测试（当前 39 个测试，含图片转换和 QSV 参数测试）
+# 后端测试（当前 40 个测试，含图片转换和 QSV 参数测试）
 cargo test -p wcdc-server
 ```
 
@@ -282,6 +282,7 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
   - 创建任务前会先做一次 `self_test::verify_encoder` 单帧预检（按 encoder/accel/device/ffmpeg 缓存 5 分钟）。预检失败会直接改用软件编码，不再先启动一个注定失败的硬件任务。
   - 典型情况：Intel 核显只支持 AV1 解码、FFmpeg 仍报告 `av1_qsv`/`av1_vaapi`，预检会识别并回退到 `libsvtav1`。
   - CRF/CQ/global_quality/qp 映射见 `append_quality_args`。
+  - 帧率：`fps` 为空/0 保持源帧率；固定值通过 `fps=24`、`fps=24000/1001` 等滤镜重采样。前端提供原始、24/25/30/60、自定义。
 - 任务：`apps/server/src/transcode/job.rs`
   - 临时文件 `.part`，成功后替换；勾选删除原文件时复用原文件名并在成功后删除源文件。
   - 进度、ETA、速度、GPU 利用率通过 SSE `/api/transcode/events`。

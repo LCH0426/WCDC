@@ -612,8 +612,19 @@ impl TranscodeService {
             "custom" => "自定义分辨率".to_string(),
             value => value.to_uppercase(),
         };
+        let fps_label = settings
+            .fps
+            .filter(|value| *value > 0.0)
+            .map(|value| {
+                if (value.fract()).abs() < 0.001 {
+                    format!("{value:.0} fps")
+                } else {
+                    format!("{value:.3} fps")
+                }
+            })
+            .unwrap_or_else(|| "原始帧率".to_string());
         let summary = format!(
-            "{} · {} · {} · {} · {} · 并发 {}",
+            "{} · {} · {} · {} · {} · {} · 并发 {}",
             settings.target_codec.to_uppercase(),
             settings.container.to_uppercase(),
             if settings.encoder.eq_ignore_ascii_case("auto") {
@@ -622,6 +633,7 @@ impl TranscodeService {
                 settings.encoder.as_str()
             },
             resolution,
+            fps_label,
             quality,
             concurrency
         );
