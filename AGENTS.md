@@ -46,7 +46,7 @@ npm run build          # tsc --noEmit && vite build
 cd ..
 cargo run -p wcdc-server
 
-# 后端测试（当前 37 个测试，含图片转换和 QSV 参数测试）
+# 后端测试（当前 39 个测试，含图片转换和 QSV 参数测试）
 cargo test -p wcdc-server
 ```
 
@@ -309,14 +309,17 @@ cp -r packaging/fnos/wcdc packaging/fnos/wcdc-beta
 - 支持 JPEG、PNG/APNG、GIF、BMP、TIFF、ICO、TGA、PNM、QOI、HDR、EXR、DDS、Farbfeld。`.webp` 源文件跳过。
 - GIF/APNG 多帧会编码为动画 WebP。
 - 默认：质量 80，有损；输出 `原文件名.webp`；转换成功后删除原图。
+- 无损模式：使用 `LosslessConfig::new()`，**忽略质量滑块**；前端的质量输入会禁用。无损输出像素精确。
 - 目标文件已存在时使用 `原文件名-2.webp` 等后缀，不覆盖已有文件。
 - `cpuThreads` 会限制同时进行的图片编码数；`concurrency` 是上限。
 - 图片任务与 ffmpeg 无关，即使没有 ffmpeg 也能使用“格式转换”标签。
 - 全部完成后前端汇总源大小、输出大小和节省比例/字节数。
 - 全部暂停/继续/取消：`POST /api/images/jobs/pause-all`、`/resume-all`、`/cancel-all`；`GET /api/images/queue`。暂停只阻止后续文件启动，正在编码的当前图片会完成。
 - 扫描结果持久化：`<数据目录>/images-last-scan.json`，`GET /api/images/scan/last`；前端选中项存 localStorage。
+- 图片扫描缓存：内存 `scan_cache` 按“路径 + 大小 + mtime”复用上次尺寸信息；重启后从 last-scan 初始化。`ImageScanResult.cacheHits` 和扫描进度都会显示缓存命中数。
 - 图片扫描进度：`GET /api/images/scan/progress`；扫描在后台任务中执行，切换标签/断开请求不会中断，完成后写入 last-scan。
 - 断点恢复：活动图片任务写入 `<数据目录>/image-jobs.json`，重启后自动恢复；已完成/输出已存在的图片跳过。
+- 稳定性：转换有 256MB 文件上限、16384 尺寸上限、50MP 像素上限、动画 2000 帧/200MP 上限；`spawn_blocking` 内用 `catch_unwind` 将 panic 转成单任务失败，不拖垮服务。
 
 ### 7.1 转换归档日志
 

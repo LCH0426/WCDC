@@ -420,6 +420,7 @@ export interface ImageScanResult {
   scanned: number;
   matched: number;
   skippedBySize: number;
+  cacheHits: number;
   files: ImageFile[];
   errors: string[];
   tookMs: number;
@@ -433,6 +434,7 @@ export interface ImageScanProgress {
   matched: number;
   errors: number;
   skippedBySize: number;
+  cacheHits: number;
   startedAt: number;
   finishedAt?: number | null;
   tookMs: number;

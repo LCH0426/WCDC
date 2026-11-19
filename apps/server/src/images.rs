@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::stream::{self, StreamExt};
-use image::{AnimationDecoder, DynamicImage};
+use image::{AnimationDecoder, DynamicImage, ImageDecoder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -22,6 +23,11 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 
 const SCAN_CONCURRENCY: usize = 4;
 const DEFAULT_QUALITY: u8 = 80;
+const MAX_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 16384;
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+const MAX_ANIMATION_PIXELS: u64 = 200_000_000;
+const MAX_ANIMATION_FRAMES: usize = 2000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +58,8 @@ pub struct ImageScanResult {
     pub scanned: usize,
     pub matched: usize,
     pub skipped_by_size: usize,
+    #[serde(default)]
+    pub cache_hits: usize,
     pub files: Vec<ImageFile>,
     pub errors: Vec<String>,
     pub took_ms: u64,
@@ -67,6 +75,7 @@ pub struct ImageScanProgress {
     pub matched: usize,
     pub errors: usize,
     pub skipped_by_size: usize,
+    pub cache_hits: usize,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub took_ms: u64,
@@ -157,6 +166,7 @@ pub struct ImageService {
     inner: Arc<Inner>,
     data_dir: PathBuf,
     last_scan: Arc<RwLock<Option<ImageScanResult>>>,
+    scan_cache: Arc<RwLock<HashMap<String, ImageFile>>>,
     scan_lock: Arc<Mutex<()>>,
     scan_progress: Arc<RwLock<ImageScanProgress>>,
     history: Arc<crate::history::HistoryService>,
@@ -175,6 +185,15 @@ impl ImageService {
                     None
                 }
             });
+        let scan_cache = last_scan
+            .as_ref()
+            .map(|scan| {
+                scan.files
+                    .iter()
+                    .map(|file| (file.path.clone(), file.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             inner: Arc::new(Inner {
                 jobs: RwLock::new(HashMap::new()),
@@ -184,6 +203,7 @@ impl ImageService {
             }),
             data_dir,
             last_scan: Arc::new(RwLock::new(last_scan)),
+            scan_cache: Arc::new(RwLock::new(scan_cache)),
             scan_lock: Arc::new(Mutex::new(())),
             scan_progress: Arc::new(RwLock::new(ImageScanProgress::default())),
             history,
@@ -267,14 +287,38 @@ impl ImageService {
             progress.skipped_by_size = skipped_by_size;
         }
         let progress_state = self.scan_progress.clone();
+        let cache = self.scan_cache.clone();
         let results = stream::iter(paths.into_iter().map(|path| {
             let progress = progress_state.clone();
+            let cache = cache.clone();
             async move {
-                let probe_path = path.clone();
-                let result = tokio::task::spawn_blocking(move || image_metadata(&probe_path))
-                    .await
-                    .unwrap_or_else(|error| Err(format!("读取图片信息失败: {error}")));
-                progress.write().await.processed += 1;
+                let key = path.to_string_lossy().to_string();
+                let cached = {
+                    let cache = cache.read().await;
+                    cache
+                        .get(&key)
+                        .cloned()
+                        .filter(|file| image_file_matches(&path, file))
+                };
+                let result = if let Some(file) = cached {
+                    let mut progress = progress.write().await;
+                    progress.processed += 1;
+                    progress.cache_hits += 1;
+                    Ok(file)
+                } else {
+                    let probe_path = path.clone();
+                    let result = tokio::task::spawn_blocking(move || image_metadata(&probe_path))
+                        .await
+                        .unwrap_or_else(|error| Err(format!("读取图片信息失败: {error}")));
+                    if let Ok(file) = &result {
+                        cache
+                            .write()
+                            .await
+                            .insert(file.path.clone(), file.clone());
+                    }
+                    progress.write().await.processed += 1;
+                    result
+                };
                 (path, result)
             }
         }))
@@ -296,11 +340,13 @@ impl ImageService {
         }
         files.sort_by(|left, right| left.path.cmp(&right.path));
 
+        let cache_hits = self.scan_progress.read().await.cache_hits;
         let result = ImageScanResult {
             directory: directory_path.to_string_lossy().to_string(),
             scanned,
             matched: files.len(),
             skipped_by_size,
+            cache_hits,
             files,
             errors,
             took_ms: started.elapsed().as_millis() as u64,
@@ -331,6 +377,7 @@ impl ImageService {
         progress.matched = result.matched;
         progress.errors = result.errors.len();
         progress.skipped_by_size = result.skipped_by_size;
+        progress.cache_hits = result.cache_hits;
         progress.took_ms = result.took_ms;
         progress.finished_at = Some(now_ms());
         progress.error = None;
@@ -480,12 +527,11 @@ impl ImageService {
 
         let batch_ids: HashSet<String> = ids.iter().cloned().collect();
         let batch_started_at = now_ms();
-        let summary = format!(
-            "WebP · 质量 {} · {} · 并发 {}",
-            quality,
-            if request.lossless { "无损" } else { "有损" },
-            workers
-        );
+        let summary = if request.lossless {
+            format!("WebP · 无损 · 并发 {}", workers)
+        } else {
+            format!("WebP · 质量 {} · 有损 · 并发 {}", quality, workers)
+        };
         for id in ids {
             let manager = self.clone();
             let semaphore = semaphore.clone();
@@ -595,16 +641,24 @@ impl ImageService {
         let temp_for_task = temp.clone();
         let cancel_for_task = cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            convert_image(
-                &source_for_task,
-                &temp_for_task,
-                quality,
-                lossless,
-                &cancel_for_task,
-                &|progress| {
-                    let _ = progress_tx.send(progress);
-                },
-            )
+            catch_unwind(AssertUnwindSafe(|| {
+                convert_image(
+                    &source_for_task,
+                    &temp_for_task,
+                    quality,
+                    lossless,
+                    &cancel_for_task,
+                    &|progress| {
+                        let _ = progress_tx.send(progress);
+                    },
+                )
+            }))
+            .unwrap_or_else(|payload| {
+                Err(format!(
+                    "图片转换内部异常: {}",
+                    panic_message(payload.as_ref())
+                ))
+            })
         })
         .await;
         let _ = progress_task.await;
@@ -1066,6 +1120,24 @@ fn format_label(path: &Path) -> String {
     }
 }
 
+fn image_file_matches(path: &Path, file: &ImageFile) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() != file.size_bytes {
+        return false;
+    }
+    if file.modified_at == 0 {
+        return true;
+    }
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64 == file.modified_at)
+        .unwrap_or(false)
+}
+
 fn image_metadata(path: &Path) -> Result<ImageFile, String> {
     let reader = image::ImageReader::open(path)
         .map_err(|error| format!("无法打开图片: {error}"))?
@@ -1078,6 +1150,7 @@ fn image_metadata(path: &Path) -> Result<ImageFile, String> {
     let (width, height) = reader
         .into_dimensions()
         .map_err(|error| format!("无法读取图片尺寸: {error}"))?;
+    check_image_size(width, height)?;
     let metadata = std::fs::metadata(path).map_err(|error| format!("无法读取文件: {error}"))?;
     let modified_at = metadata
         .modified()
@@ -1155,6 +1228,15 @@ fn convert_image(
     cancel: &CancellationToken,
     progress: &dyn Fn(f64),
 ) -> Result<ConvertedImage, String> {
+    let metadata = std::fs::metadata(source)
+        .map_err(|error| format!("无法读取 {}: {error}", source.display()))?;
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "图片文件过大（{}），上限为 {}",
+            human_bytes(metadata.len()),
+            human_bytes(MAX_IMAGE_BYTES)
+        ));
+    }
     let data = std::fs::read(source)
         .map_err(|error| format!("无法读取 {}: {error}", source.display()))?;
     if data.is_empty() {
@@ -1211,6 +1293,53 @@ fn convert_image(
     })
 }
 
+fn image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_BYTES);
+    limits
+}
+
+fn check_image_size(width: u32, height: u32) -> Result<(), String> {
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_DIMENSION
+        || height > MAX_IMAGE_DIMENSION
+    {
+        return Err(format!("图片尺寸不支持：{width}x{height}"));
+    }
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(format!(
+            "图片像素过多：{width}x{height}（上限 {} 百万像素）",
+            MAX_IMAGE_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
+fn collect_animation_frames(frames: image::Frames<'_>) -> Result<Vec<image::Frame>, String> {
+    let mut collected = Vec::new();
+    let mut total_pixels = 0u64;
+    for frame in frames {
+        if collected.len() >= MAX_ANIMATION_FRAMES {
+            return Err(format!(
+                "动画帧数过多，上限为 {MAX_ANIMATION_FRAMES} 帧"
+            ));
+        }
+        let frame = frame.map_err(|error| format!("动画帧解码失败: {error}"))?;
+        let buffer = frame.buffer();
+        check_image_size(buffer.width(), buffer.height())?;
+        total_pixels = total_pixels
+            .saturating_add(u64::from(buffer.width()) * u64::from(buffer.height()));
+        if total_pixels > MAX_ANIMATION_PIXELS {
+            return Err("动画总像素过多，已拒绝转换".to_string());
+        }
+        collected.push(frame);
+    }
+    Ok(collected)
+}
+
 fn decode_image(source: &Path, data: &[u8]) -> Result<Decoded, String> {
     let extension = source
         .extension()
@@ -1218,12 +1347,12 @@ fn decode_image(source: &Path, data: &[u8]) -> Result<Decoded, String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if extension == "gif" {
-        let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(data))
+        let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(data))
             .map_err(|error| format!("GIF 解码失败: {error}"))?;
-        let frames = decoder
-            .into_frames()
-            .collect_frames()
-            .map_err(|error| format!("GIF 帧解码失败: {error}"))?;
+        decoder
+            .set_limits(image_limits())
+            .map_err(|error| format!("GIF 尺寸超出限制: {error}"))?;
+        let frames = collect_animation_frames(decoder.into_frames())?;
         if frames.is_empty() {
             return Err("GIF 中没有图片帧".to_string());
         }
@@ -1236,22 +1365,31 @@ fn decode_image(source: &Path, data: &[u8]) -> Result<Decoded, String> {
         )));
     }
     if extension == "png" || extension == "apng" {
-        let decoder = image::codecs::png::PngDecoder::new(Cursor::new(data))
+        let mut decoder = image::codecs::png::PngDecoder::new(Cursor::new(data))
             .map_err(|error| format!("PNG 解码失败: {error}"))?;
+        decoder
+            .set_limits(image_limits())
+            .map_err(|error| format!("PNG 尺寸超出限制: {error}"))?;
         if decoder.is_apng().unwrap_or(false) {
-            let frames = decoder
-                .apng()
-                .map_err(|error| format!("APNG 解码失败: {error}"))?
-                .into_frames()
-                .collect_frames()
-                .map_err(|error| format!("APNG 帧解码失败: {error}"))?;
+            let frames = collect_animation_frames(
+                decoder
+                    .apng()
+                    .map_err(|error| format!("APNG 解码失败: {error}"))?
+                    .into_frames(),
+            )?;
             if frames.len() > 1 {
                 return Ok(Decoded::Animation(frames));
             }
         }
     }
-    let image = image::load_from_memory(&data)
+    let mut reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| format!("无法识别图片格式: {error}"))?;
+    reader.limits(image_limits());
+    let image = reader
+        .decode()
         .map_err(|error| format!("图片解码失败: {error}"))?;
+    check_image_size(image.width(), image.height())?;
     Ok(Decoded::Static(image))
 }
 
@@ -1263,13 +1401,11 @@ fn encode_static(
     let has_alpha = image.color().has_alpha();
     let width = image.width();
     let height = image.height();
-    if width == 0 || height == 0 {
-        return Err("图片尺寸无效".to_string());
-    }
+    check_image_size(width, height)?;
     if lossless {
-        let config = LosslessConfig::new()
-            .with_quality(f32::from(quality))
-            .with_method(4);
+        // Lossless mode is pixel-exact; the UI quality slider does not apply.
+        // Keep a fixed compression effort so behavior is predictable.
+        let config = LosslessConfig::new().with_method(4);
         if has_alpha {
             let pixels = image.to_rgba8();
             EncodeRequest::lossless(
@@ -1320,15 +1456,10 @@ fn encode_animation(
 ) -> Result<Vec<u8>, String> {
     let width = frames[0].buffer().width();
     let height = frames[0].buffer().height();
-    if width == 0 || height == 0 {
-        return Err("动画尺寸无效".to_string());
-    }
+    check_image_size(width, height)?;
     let config = if lossless {
-        EncoderConfig::Lossless(
-            LosslessConfig::new()
-                .with_quality(f32::from(quality))
-                .with_method(4),
-        )
+        // Lossless mode ignores the lossy quality setting.
+        EncoderConfig::Lossless(LosslessConfig::new().with_method(4))
     } else {
         EncoderConfig::Lossy(
             LossyConfig::new()
@@ -1365,6 +1496,27 @@ fn encode_animation(
     encoder
         .finalize(last_duration)
         .map_err(|error| format!("动画 WebP 封装失败: {error}"))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "未知错误".to_string()
+    }
 }
 
 fn now_ms() -> i64 {
@@ -1468,5 +1620,22 @@ mod tests {
         assert!(bytes.starts_with(b"RIFF"));
         assert_eq!(&bytes[8..12], b"WEBP");
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn lossless_ignores_quality_setting() {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(32, 24, |x, y| {
+            image::Rgba([(x * 7) as u8, (y * 9) as u8, (x + y) as u8, 255])
+        }));
+        let low = encode_static(&image, 10, true).unwrap();
+        let high = encode_static(&image, 90, true).unwrap();
+        assert_eq!(low, high);
+    }
+
+    #[test]
+    fn rejects_oversized_images_before_allocating() {
+        assert!(check_image_size(MAX_IMAGE_DIMENSION + 1, 10).is_err());
+        assert!(check_image_size(10000, 10000).is_err());
+        assert!(check_image_size(1920, 1080).is_ok());
     }
 }

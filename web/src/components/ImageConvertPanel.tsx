@@ -204,7 +204,8 @@ function ImageJobRow({
         className='mt-0.5 truncate text-[11px] text-slate-500 dark:text-slate-400'
         title={`${job.sourcePath} → ${job.outputPath}`}
       >
-        {job.sourceFormat} {job.width}x{job.height} → WebP · 质量 {job.quality}
+        {job.sourceFormat} {job.width}x{job.height} → WebP
+        {job.lossless ? ' · 无损' : ` · 质量 ${job.quality}`}
         {job.frames > 1 ? ` · ${job.frames} 帧` : ''}
       </div>
 
@@ -764,7 +765,11 @@ export function ImageConvertPanel() {
                     scanResult.skippedBySize > 0
                       ? `（大小筛选排除 ${scanResult.skippedBySize} 张）`
                       : ''
-                  }，匹配 ${scanResult.matched} 张，用时 ${scanResult.tookMs} ms`
+                  }，匹配 ${scanResult.matched} 张${
+                    scanResult.cacheHits > 0
+                      ? `，缓存命中 ${scanResult.cacheHits} 张`
+                      : ''
+                  }，用时 ${scanResult.tookMs} ms`
                 : '支持 JPEG、PNG、APNG、GIF、BMP、TIFF、ICO、TGA、QOI、HDR、EXR 等'}
             </div>
           </div>
@@ -775,7 +780,11 @@ export function ImageConvertPanel() {
                 <span className='font-medium text-primary'>正在分析图片信息…</span>
                 <span>
                   {scanProgress
-                    ? `${scanProgress.processed} / ${scanProgress.total || '…'}`
+                    ? `${scanProgress.processed} / ${scanProgress.total || '…'}${
+                        scanProgress.cacheHits > 0
+                          ? ` · 缓存命中 ${scanProgress.cacheHits}`
+                          : ''
+                      }`
                     : '准备中'}
                 </span>
               </div>
@@ -830,7 +839,12 @@ export function ImageConvertPanel() {
                 max={100}
                 value={String(quality)}
                 onValueChange={(value) => setQuality(Number(value))}
-                description='80 通常兼顾体积与画质'
+                isDisabled={lossless}
+                description={
+                  lossless
+                    ? '无损模式忽略质量，始终像素无损'
+                    : '80 通常兼顾体积与画质'
+                }
               />
               <div className='block'>
                 <span className='text-xs font-medium text-slate-600 dark:text-slate-300'>
